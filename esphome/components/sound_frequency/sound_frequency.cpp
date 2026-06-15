@@ -105,20 +105,32 @@ void SoundFrequencyComponent::loop() {
     this->fft_input_[j] = (float) this->samples_buffer_[j] * this->window_[j];
   }
 
-  // 3. Perform FFT using ESP-DSP
-  // We use a complex output buffer: [re0, im0, re1, im1, ...]
-  std::vector<float> complex_output(fft_size * 2);
-  esp_dsp_fft_rfft_into_complex_f32(complex_output.data(), this->fft_input_.data(), fft_size);
+  // 3. Perform FFT using ESP-DSP following the example pattern
+  // The example uses dsps_fft2r_fc32 on a complex array.
+  // We'll convert our real input to complex first.
+  std::vector<float> complex_input(fft_size * 2, 0.0f);
+  for (size_t j = 0; j < fft_size; j++) {
+    complex_input[j * 2 + 0] = this->fft_input_[j];
+    complex_input[j * 2 + 1] = 0.0f;
+  }
+
+  unsigned int start_b = dsp_get_cpu_cycle_count();
+  dsps_fft2r_fc32(complex_input.data(), fft_size);
+  unsigned int end_b = dsp_get_cpu_cycle_count();
+
+  // Bit reverse
+  dsps_bit_rev_fc32(complex_input.data(), fft_size);
+
+  // Convert one complex vector to two complex vectors
+  dsps_cplx2reC_fc32(complex_input.data(), fft_size);
 
   // 4. Find peak frequency
   float max_magnitude = 0.0f;
   uint32_t max_index = 0;
 
-  // RFFT output size for real input of size N is N/2 + 1 (including DC and Nyquist)
-  // But esp_dsp_fft_rfft_into_complex_f32 returns N/2 complex pairs.
   for (uint32_t j = 0; j < fft_size / 2; j++) {
-    float real = complex_output[2 * j];
-    float imag = complex_output[2 * j + 1];
+    float real = complex_input[2 * j];
+    float imag = complex_input[2 * j + 1];
     float magnitude = sqrtf(real * real + imag * imag);
 
     if (magnitude > max_magnitude) {
@@ -126,8 +138,6 @@ void SoundFrequencyComponent::loop() {
       max_index = j;
     }
   }
-
-  // 5. Publish result
   if (max_magnitude > 50.0f) {  // Threshold to ignore noise
     float frequency = (float) max_index * this->sample_rate_ / fft_size;
     this->frequency_sensor_->publish_state(frequency);

@@ -9,9 +9,7 @@
 
 #include "esphome/core/automation.h"
 #include "esphome/core/component.h"
-#ifdef USE_ESP32
 #include "esp_dsp.h"
-#endif
 
 namespace esphome::sound_frequency {
 
