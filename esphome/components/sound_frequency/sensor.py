@@ -7,7 +7,6 @@ from esphome.const import (
     CONF_ID,
     CONF_MEASUREMENT_DURATION,
     CONF_MICROPHONE,
-    CONF_SAMPLE_RATE,
     DEVICE_CLASS_FREQUENCY,
     PLATFORM_ESP32,
     STATE_CLASS_MEASUREMENT,
@@ -47,7 +46,6 @@ CONFIG_SCHEMA = cv.All(
                 max_bits_per_sample=16,
             ),
             cv.Required(CONF_PASSIVE): cv.boolean,
-            cv.Optional(CONF_SAMPLE_RATE): cv.positive_int,
             cv.Optional(CONF_FREQUENCY): sensor.sensor_schema(
                 unit_of_measurement=UNIT_HERTZ,
                 accuracy_decimals=0,
@@ -70,9 +68,6 @@ async def to_code(config):
     cg.add(var.set_microphone_source(mic_source))
 
     cg.add(var.set_measurement_duration(config[CONF_MEASUREMENT_DURATION]))
-
-    if sample_rate := config.get(CONF_SAMPLE_RATE):
-        cg.add(var.set_sample_rate(sample_rate))
 
     if freq_config := config.get(CONF_FREQUENCY):
         sens = await sensor.new_sensor(freq_config)
