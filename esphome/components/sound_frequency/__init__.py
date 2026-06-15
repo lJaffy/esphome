@@ -1,6 +1,7 @@
 from esphome import automation
 import esphome.codegen as cg
 from esphome.components import microphone, sensor
+from esphome.components.esp32 import add_idf_component
 import esphome.config_validation as cv
 from esphome.const import (
     CONF_FREQUENCY,
@@ -62,6 +63,7 @@ async def to_code(config):
     var = cg.new_Pvariable(config[CONF_ID])
     await cg.register_component(var, config)
 
+    add_idf_component(name="espressif/esp-dsp", ref="1.7.1")
     mic_source = await microphone.microphone_source_to_code(
         config[CONF_MICROPHONE], passive=config[CONF_PASSIVE]
     )
