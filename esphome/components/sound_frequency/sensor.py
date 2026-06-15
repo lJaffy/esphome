@@ -15,7 +15,7 @@ from esphome.const import (
 )
 
 AUTO_LOAD = ["audio"]
-CODEOWNERS = ["@ljaffy"]
+CODEOWNERS = ["@lJaffy"]
 DEPENDENCIES = ["microphone"]
 
 
