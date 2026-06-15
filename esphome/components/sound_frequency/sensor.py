@@ -92,16 +92,10 @@ SOUND_FREQUENCY_ACTION_SCHEMA = automation.maybe_simple_id(
     SOUND_FREQUENCY_ACTION_SCHEMA,
     synchronous=True,
 )
-async def sound_frequency_start_to_code(config, action_id, template_arg, args):
-    var = cg.new_Pvariable(action_id, template_arg)
-    await cg.register_parented(var, config[CONF_ID])
-    return var
-
-
 @automation.register_action(
     "sound_frequency.stop", StopAction, SOUND_FREQUENCY_ACTION_SCHEMA, synchronous=True
 )
-async def sound_frequency_stop_to_code(config, action_id, template_arg, args):
+async def sound_frequency_action_to_code(config, action_id, template_arg, args):
     var = cg.new_Pvariable(action_id, template_arg)
     await cg.register_parented(var, config[CONF_ID])
     return var
