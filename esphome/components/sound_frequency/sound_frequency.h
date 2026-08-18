@@ -9,10 +9,6 @@
 #include "esphome/core/automation.h"
 #include "esphome/core/component.h"
 
-#ifdef USE_ESP32
-#include "esp_dsp.h"
-#endif
-
 namespace esphome::sound_frequency {
 
 class SoundFrequencyComponent : public Component {
@@ -38,14 +34,29 @@ class SoundFrequencyComponent : public Component {
     this->peak_magnitude_sensor_ = peak_magnitude_sensor;
   }
 
+  /// @brief Starts the MicrophoneSource to start measuring the dominant frequency
   void start();
+
+  /// @brief Stops the MicrophoneSource
   void stop();
 
  protected:
+  /// @brief Internal start command that, if necessary, allocates a ring buffer and a zero-copy
+  /// ``RingBufferAudioSource`` that reads directly from it. ``ring_buffer_`` weakly references the
+  /// ring buffer owned by ``audio_source_``. Returns true if allocations were successful.
   bool start_();
+
+  /// @brief Internal stop command that deallocates ``audio_source_`` (which releases its ring buffer)
   void stop_();
 
+  /// @brief Runs the esp-dsp real FFT on one full window of samples and accumulates the power spectrum
+  bool process_fft_frame_(const int16_t *samples);
+
+  /// @brief Averages the accumulated periodogram, picks the in-band peak, refines it sub-bin, and publishes
+  void emit_window_();
+
   microphone::MicrophoneSource *microphone_source_{nullptr};
+
   sensor::Sensor *frequency_sensor_{nullptr};
   sensor::Sensor *peak_magnitude_sensor_{nullptr};
 
@@ -59,11 +70,21 @@ class SoundFrequencyComponent : public Component {
 
   uint32_t measurement_duration_ms_{1000};
 
-  float *window_{nullptr};
-  float *work_{nullptr};
-  float *accum_{nullptr};
-  uint32_t frame_count_{0};
-  uint32_t sample_count_{0};
+  // DSP working set, allocated once in setup() - no heap is touched from loop() after that
+  float *window_{nullptr};  ///< Hann window coefficients, N floats
+  float *work_{nullptr};    ///< complex FFT work buffer (interleaved re/im), 2*N floats, 16-byte aligned
+  float *accum_{nullptr};   ///< averaged power spectrum accumulator, N/2 floats
+
+  uint32_t k_min_{0};  ///< first in-band bin index (excludes DC)
+  uint32_t k_max_{0};  ///< last in-band bin index (excludes Nyquist)
+
+  float sample_rate_hz_{0.0f};  ///< runtime sample rate taken from the microphone device
+
+  bool dsp_initialized_{false};
+  bool band_valid_{false};
+
+  uint32_t frame_count_{0};          ///< FFT frames accumulated into ``accum_`` since the last window emit
+  uint32_t window_sample_count_{0};  ///< samples consumed since the last window emit
 };
 
 template<typename... Ts> class StartAction : public Action<Ts...>, public Parented<SoundFrequencyComponent> {

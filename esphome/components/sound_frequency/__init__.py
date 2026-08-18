@@ -12,6 +12,7 @@ from esphome.const import (
     DEVICE_CLASS_FREQUENCY,
     PLATFORM_ESP32,
     STATE_CLASS_MEASUREMENT,
+    UNIT_DECIBEL,
     UNIT_HERTZ,
 )
 
@@ -34,6 +35,22 @@ SoundFrequencyComponent = sound_frequency_ns.class_(
 StartAction = sound_frequency_ns.class_("StartAction", automation.Action)
 StopAction = sound_frequency_ns.class_("StopAction", automation.Action)
 
+
+def _validate_power_of_two(value):
+    if value != 0 and (value & (value - 1)) == 0:
+        return value
+    raise cv.Invalid("window_size must be a power of two")
+
+
+def _check_min_below_max(config):
+    if config[CONF_MIN_FREQUENCY] >= config[CONF_MAX_FREQUENCY]:
+        raise cv.Invalid(
+            f"min_frequency ({config[CONF_MIN_FREQUENCY]}Hz) must be lower than "
+            f"max_frequency ({config[CONF_MAX_FREQUENCY]}Hz)"
+        )
+    return config
+
+
 CONFIG_SCHEMA = cv.All(
     cv.Schema(
         {
@@ -53,10 +70,10 @@ CONFIG_SCHEMA = cv.All(
             ),
             cv.Required(CONF_PASSIVE): cv.boolean,
             cv.Optional(CONF_WINDOW_SIZE, default=1024): cv.All(
-                cv.int_, lambda x: (x != 0) and (x & (x - 1) == 0) and 64 <= x <= 4096
+                cv.int_range(min=64, max=4096), _validate_power_of_two
             ),
-            cv.Optional(CONF_MIN_FREQUENCY, default=100.0): cv.frequency,
-            cv.Optional(CONF_MAX_FREQUENCY, default=12000.0): cv.frequency,
+            cv.Optional(CONF_MIN_FREQUENCY, default="100Hz"): cv.frequency,
+            cv.Optional(CONF_MAX_FREQUENCY, default="12000Hz"): cv.frequency,
             cv.Optional(CONF_THRESHOLD_DB, default=-50.0): cv.All(
                 cv.float_, cv.Range(min=-80.0, max=0.0)
             ),
@@ -67,13 +84,15 @@ CONFIG_SCHEMA = cv.All(
                 state_class=STATE_CLASS_MEASUREMENT,
             ),
             cv.Optional(CONF_PEAK_MAGNITUDE): sensor.sensor_schema(
-                unit_of_measurement="dB",
+                unit_of_measurement=UNIT_DECIBEL,
                 accuracy_decimals=1,
                 state_class=STATE_CLASS_MEASUREMENT,
             ),
         }
     ).extend(cv.COMPONENT_SCHEMA),
+    _check_min_below_max,
     cv.only_on([PLATFORM_ESP32]),
+    cv.only_with_framework("esp-idf"),
 )
 
 
@@ -112,3 +131,18 @@ SOUND_FREQUENCY_ACTION_SCHEMA = automation.maybe_simple_id(
         cv.GenerateID(): cv.use_id(SoundFrequencyComponent),
     }
 )
+
+
+@automation.register_action(
+    "sound_frequency.start",
+    StartAction,
+    SOUND_FREQUENCY_ACTION_SCHEMA,
+    synchronous=True,
+)
+@automation.register_action(
+    "sound_frequency.stop", StopAction, SOUND_FREQUENCY_ACTION_SCHEMA, synchronous=True
+)
+async def sound_frequency_action_to_code(config, action_id, template_arg, args):
+    var = cg.new_Pvariable(action_id, template_arg)
+    await cg.register_parented(var, config[CONF_ID])
+    return var
