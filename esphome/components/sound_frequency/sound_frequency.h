@@ -83,6 +83,9 @@ class SoundFrequencyComponent : public Component {
   bool dsp_initialized_{false};
   bool band_valid_{false};
 
+  uint32_t diagnostic_log_ms_{0};          ///< wall-clock time of the last periodic diagnostic log (ms)
+  bool diagnostic_window_emitted_{false};  ///< true once the first measurement window has been emitted
+
   uint32_t frame_count_{0};          ///< FFT frames accumulated into ``accum_`` since the last window emit
   uint32_t window_sample_count_{0};  ///< samples consumed since the last window emit
 };

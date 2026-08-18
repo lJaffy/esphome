@@ -12,6 +12,10 @@
 #include <cstdint>
 #include <cstring>
 
+// Throttle for the periodic loop diagnostics (see loop()). The one-shot events
+// (DSP init, band computation, first window emit) are not throttled.
+static const uint32_t DIAGNOSTIC_LOG_INTERVAL_MS = 5000;
+
 namespace esphome::sound_frequency {
 
 static const char *const TAG = "sound_frequency";
@@ -98,6 +102,7 @@ void SoundFrequencyComponent::loop() {
     if (this->start_()) {
       this->status_clear_warning();
     } else {
+      ESP_LOGW(TAG, "Internal buffers failed to allocate");
       return;
     }
   } else {
@@ -154,6 +159,12 @@ void SoundFrequencyComponent::loop() {
                "Frequency band %.0f-%.0f Hz is outside the analyzable range for a sample rate of %" PRIu32
                " Hz and window size %" PRIu32,
                this->min_frequency_hz_, this->max_frequency_hz_, stream_info.get_sample_rate(), n);
+    } else {
+      ESP_LOGW(TAG,
+               "Frequency band %.0f-%.0f Hz maps to bins %lu-%lu of %" PRIu32 " (sample rate %" PRIu32
+               " Hz, window size %" PRIu32 ")",
+               this->min_frequency_hz_, this->max_frequency_hz_, static_cast<unsigned long>(k_min),
+               static_cast<unsigned long>(k_max), n / 2, stream_info.get_sample_rate(), n);
     }
   }
 
@@ -161,8 +172,13 @@ void SoundFrequencyComponent::loop() {
   // pre_shift is ignored by RingBufferAudioSource (no intermediate transfer buffer to compact).
   this->audio_source_->fill(0, false);
 
-  if (this->audio_source_->available() < stream_info.samples_to_bytes(this->window_size_)) {
+  const uint32_t bytes_needed = stream_info.samples_to_bytes(this->window_size_);
+  if (this->audio_source_->available() < bytes_needed) {
     // Not enough audio for a full FFT window yet - wait for more without consuming anything
+    this->diagnostic_log_ms_ = millis();
+    ESP_LOGW(TAG, "Starving: only %" PRIu32 " of %" PRIu32 " bytes (%" PRIu32 " samples) available in the ring buffer",
+             this->audio_source_->available(), bytes_needed,
+             stream_info.bytes_to_samples(this->audio_source_->available()));
     return;
   }
 
@@ -178,6 +194,8 @@ void SoundFrequencyComponent::loop() {
   if (this->band_valid_) {
     // Emit the window when the measurement duration has been covered or the frame cap is reached
     if (this->window_sample_count_ >= samples_in_window || this->frame_count_ >= MAX_FFT_FRAMES) {
+      ESP_LOGW(TAG, "Window emit: %" PRIu32 " frames, %" PRIu32 "/%" PRIu32 " samples (%" PRIu32 " ms target)",
+               this->frame_count_, this->window_sample_count_, samples_in_window, this->measurement_duration_ms_);
       this->emit_window_();
     }
   } else {
@@ -280,6 +298,11 @@ void SoundFrequencyComponent::emit_window_() {
   if (this->frequency_sensor_ != nullptr) {
     this->frequency_sensor_->publish_state(publish_frequency ? frequency_hz : NAN);
   }
+
+  ESP_LOGW(TAG, "Window result: bin %lu (%.1f Hz), peak %.2f dB vs threshold %.1f dB -> %s",
+           static_cast<unsigned long>(k_star),
+           (static_cast<float>(k_star) * this->sample_rate_hz_) / static_cast<float>(n), peak_db,
+           this->peak_threshold_db_, publish_frequency ? "publish" : "suppress");
 
   // Reset accumulators for the next measurement window
   memset(this->accum_, 0, (n / 2) * sizeof(float));
