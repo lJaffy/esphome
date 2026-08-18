@@ -55,7 +55,7 @@ void SoundFrequencyComponent::setup() {
   // esp-dsp SIMD kernels require 16-byte aligned buffers
   void *aligned_work = nullptr;
   if (posix_memalign(&aligned_work, 16, 2 * n * sizeof(float)) != 0 || aligned_work == nullptr) {
-    ESP_LOGE(TAG, "Failed to allocate FFT work buffer (%u bytes)", 2 * n * static_cast<uint32_t>(sizeof(float)));
+    ESP_LOGE(TAG, "Failed to allocate FFT work buffer (%" PRIu64 " bytes)", 2 * n * sizeof(float));
     return;
   }
 
@@ -150,10 +150,10 @@ void SoundFrequencyComponent::loop() {
     this->k_max_ = k_max;
     this->band_valid_ = (k_min < k_max);
     if (!this->band_valid_) {
-      ESP_LOGW(
-          TAG,
-          "Frequency band %.0f-%.0f Hz is outside the analyzable range for a sample rate of %u Hz and window size %u",
-          this->min_frequency_hz_, this->max_frequency_hz_, stream_info.get_sample_rate(), n);
+      ESP_LOGW(TAG,
+               "Frequency band %.0f-%.0f Hz is outside the analyzable range for a sample rate of %" PRIu32
+               " Hz and window size %" PRIu32,
+               this->min_frequency_hz_, this->max_frequency_hz_, stream_info.get_sample_rate(), n);
     }
   }
 
