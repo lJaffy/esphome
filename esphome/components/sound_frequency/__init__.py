@@ -8,6 +8,7 @@ from esphome.const import (
     CONF_ID,
     CONF_MEASUREMENT_DURATION,
     CONF_MICROPHONE,
+    CONF_WINDOW_SIZE,
     DEVICE_CLASS_FREQUENCY,
     PLATFORM_ESP32,
     STATE_CLASS_MEASUREMENT,
@@ -20,6 +21,10 @@ DEPENDENCIES = ["microphone"]
 
 
 CONF_PASSIVE = "passive"
+CONF_MIN_FREQUENCY = "min_frequency"
+CONF_MAX_FREQUENCY = "max_frequency"
+CONF_THRESHOLD_DB = "threshold_db"
+CONF_PEAK_MAGNITUDE = "peak_magnitude"
 
 sound_frequency_ns = cg.esphome_ns.namespace("sound_frequency")
 SoundFrequencyComponent = sound_frequency_ns.class_(
@@ -47,10 +52,23 @@ CONFIG_SCHEMA = cv.All(
                 max_bits_per_sample=16,
             ),
             cv.Required(CONF_PASSIVE): cv.boolean,
+            cv.Optional(CONF_WINDOW_SIZE, default=1024): cv.All(
+                cv.int_, lambda x: (x != 0) and (x & (x - 1) == 0) and 64 <= x <= 4096
+            ),
+            cv.Optional(CONF_MIN_FREQUENCY, default=100.0): cv.frequency,
+            cv.Optional(CONF_MAX_FREQUENCY, default=12000.0): cv.frequency,
+            cv.Optional(CONF_THRESHOLD_DB, default=-50.0): cv.All(
+                cv.float_, cv.Range(min=-80.0, max=0.0)
+            ),
             cv.Optional(CONF_FREQUENCY): sensor.sensor_schema(
                 unit_of_measurement=UNIT_HERTZ,
                 accuracy_decimals=0,
                 device_class=DEVICE_CLASS_FREQUENCY,
+                state_class=STATE_CLASS_MEASUREMENT,
+            ),
+            cv.Optional(CONF_PEAK_MAGNITUDE): sensor.sensor_schema(
+                unit_of_measurement="dB",
+                accuracy_decimals=1,
                 state_class=STATE_CLASS_MEASUREMENT,
             ),
         }
@@ -70,10 +88,23 @@ async def to_code(config):
     cg.add(var.set_microphone_source(mic_source))
 
     cg.add(var.set_measurement_duration(config[CONF_MEASUREMENT_DURATION]))
+    cg.add(var.set_window_size(config[CONF_WINDOW_SIZE]))
+    cg.add(var.set_min_frequency_hz(config[CONF_MIN_FREQUENCY]))
+    cg.add(var.set_max_frequency_hz(config[CONF_MAX_FREQUENCY]))
+    cg.add(var.set_peak_threshold_db(config[CONF_THRESHOLD_DB]))
 
     if freq_config := config.get(CONF_FREQUENCY):
         sens = await sensor.new_sensor(freq_config)
         cg.add(var.set_frequency_sensor(sens))
+
+    if peak_config := config.get(CONF_PEAK_MAGNITUDE):
+        sens = await sensor.new_sensor(peak_config)
+        cg.add(var.set_peak_magnitude_sensor(sens))
+
+    if not config.get(CONF_FREQUENCY) and not config.get(CONF_PEAK_MAGNITUDE):
+        raise cv.Invalid(
+            "Component must expose at least one sensor (frequency or peak_magnitude)"
+        )
 
 
 SOUND_FREQUENCY_ACTION_SCHEMA = automation.maybe_simple_id(
@@ -81,18 +112,3 @@ SOUND_FREQUENCY_ACTION_SCHEMA = automation.maybe_simple_id(
         cv.GenerateID(): cv.use_id(SoundFrequencyComponent),
     }
 )
-
-
-@automation.register_action(
-    "sound_frequency.start",
-    StartAction,
-    SOUND_FREQUENCY_ACTION_SCHEMA,
-    synchronous=True,
-)
-@automation.register_action(
-    "sound_frequency.stop", StopAction, SOUND_FREQUENCY_ACTION_SCHEMA, synchronous=True
-)
-async def sound_frequency_action_to_code(config, action_id, template_arg, args):
-    var = cg.new_Pvariable(action_id, template_arg)
-    await cg.register_parented(var, config[CONF_ID])
-    return var
