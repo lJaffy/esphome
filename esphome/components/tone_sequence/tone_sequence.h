@@ -66,6 +66,8 @@ class ToneSequenceComponent : public Component {
   uint32_t pattern_duration_ms_{2000};  ///< total deadline for the full sequence
   float tolerance_hz_{50.0f};           ///< ± Hz around each expected tone
   float threshold_db_{-50.0f};          ///< minimum dBFS for a tone to count
+  void set_release_time(uint32_t ms) { this->release_time_ms_ = ms; }
+  uint32_t release_time_ms_{3000};  ///< how long the sensor stays True after detection
 
   // ── Audio pipeline ──
   std::unique_ptr<audio::RingBufferAudioSource> audio_source_;
@@ -93,6 +95,8 @@ class ToneSequenceComponent : public Component {
   bool pattern_active_{false};
   uint8_t match_index_{0};        ///< which tone we are waiting for (0-based)
   uint32_t pattern_start_ms_{0};  ///< millis() when tone 0 first matched
+  uint32_t release_until_ms_{0};  ///< millis() deadline for holding True
+  bool detected_latched_{false};  ///< true while the sensor is in its hold period
 
   // ── Diagnostics ──
   uint32_t diag_log_ms_{0};

@@ -23,6 +23,10 @@ CONF_PASSIVE = "passive"
 CONF_TICK_INTERVAL = "tick_interval"
 CONF_PATTERN_DURATION = "pattern_duration"
 CONF_DETECTED = "detected"
+CONF_RELEASE_TIME = "release_time"
+
+# Add to the CONFIG_SCHEMA dict:
+
 
 tone_sequence_ns = cg.esphome_ns.namespace("tone_sequence")
 ToneSequenceComponent = tone_sequence_ns.class_("ToneSequenceComponent", cg.Component)
@@ -68,6 +72,12 @@ CONFIG_SCHEMA = cv.All(
                 cv.float_, cv.Range(min=-80.0, max=0.0)
             ),
             cv.Required(CONF_DETECTED): binary_sensor.binary_sensor_schema(),
+            cv.Optional(CONF_RELEASE_TIME, default="3s"): cv.All(
+                cv.positive_time_period_milliseconds,
+                cv.Range(
+                    min=cv.TimePeriod(milliseconds=500), max=cv.TimePeriod(minutes=5)
+                ),
+            ),
         }
     ).extend(cv.COMPONENT_SCHEMA),
     cv.only_on([PLATFORM_ESP32]),
@@ -98,6 +108,7 @@ async def to_code(config):
 
     detected = await binary_sensor.new_binary_sensor(config[CONF_DETECTED])
     cg.add(var.set_detected_sensor(detected))
+    cg.add(var.set_release_time(config[CONF_RELEASE_TIME]))
 
 
 # ── Actions ──

@@ -186,6 +186,15 @@ void ToneSequenceComponent::loop() {
     this->emit_tick_();
   }
 
+  // ── Release the latched detection after the hold period expires ──
+  if (this->detected_latched_ && millis() >= this->release_until_ms_) {
+    this->detected_latched_ = false;
+    if (this->detected_sensor_ != nullptr) {
+      this->detected_sensor_->publish_state(false);
+    }
+    ESP_LOGD(TAG, "Detection released after %lu ms hold", (unsigned long) this->release_time_ms_);
+  }
+
   // ── Pattern deadline check (runs every loop, not just on tick) ──
   if (this->pattern_active_) {
     const uint32_t elapsed = millis() - this->pattern_start_ms_;
@@ -306,23 +315,31 @@ void ToneSequenceComponent::evaluate_pattern_(float dominant_hz, float peak_db) 
     this->match_index_++;
 
     if (this->match_index_ >= this->num_tones_) {
-      // ── FULL SEQUENCE COMPLETE ──
       const uint32_t elapsed = millis() - this->pattern_start_ms_;
-      ESP_LOGI(TAG, "PATTERN DETECTED in %lu ms (%lu tones)", (unsigned long) elapsed,
+      ESP_LOGI(TAG, "PATTERN DETETECTED in %lu ms (%lu tones)", (unsigned long) elapsed,
                (unsigned long) this->num_tones_);
+
+      // Latch True and set a release deadline
+      this->detected_latched_ = true;
+      this->release_until_ms_ = millis() + this->release_time_ms_;
+
       if (this->detected_sensor_ != nullptr) {
         this->detected_sensor_->publish_state(true);
       }
-      this->reset_pattern_();
+
+      // Reset the matching state but do NOT publish false here
+      this->pattern_active_ = false;
+      this->match_index_ = 0;
+      return;
     }
   }
   // Wrong tone: ignored – do not reset, do not advance.
 }
-
 void ToneSequenceComponent::reset_pattern_() {
   this->pattern_active_ = false;
   this->match_index_ = 0;
-  if (this->detected_sensor_ != nullptr) {
+  // Only release the sensor if we're not currently in a hold period
+  if (!this->detected_latched_ && this->detected_sensor_ != nullptr) {
     this->detected_sensor_->publish_state(false);
   }
 }
