@@ -14,7 +14,7 @@ from esphome.const import (
     PLATFORM_ESP32,
 )
 
-AUTO_LOAD = ["audio"]
+AUTO_LOAD = ["audio", "binary_sensor"]
 CODEOWNERS = ["@lJaffy"]
 DEPENDENCIES = ["microphone"]
 
