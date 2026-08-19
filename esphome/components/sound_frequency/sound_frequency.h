@@ -88,6 +88,13 @@ class SoundFrequencyComponent : public Component {
 
   uint32_t frame_count_{0};          ///< FFT frames accumulated into ``accum_`` since the last window emit
   uint32_t window_sample_count_{0};  ///< samples consumed since the last window emit
+
+  // Ring buffer for partial FFT frames. The audio source only exposes up to MAX_FILL_DURATION_MS of audio per
+  // fill() call, which is usually far less than a full FFT window, so the window must be assembled from several
+  // fill/consume cycles. Samples are copied here and run through the FFT in whole-window units. Allocated once in
+  // setup(), freed in stop_().
+  int16_t *frame_buf_{nullptr};
+  uint32_t frame_buf_offset_{0};  ///< samples currently staged in ``frame_buf_``
 };
 
 template<typename... Ts> class StartAction : public Action<Ts...>, public Parented<SoundFrequencyComponent> {

@@ -85,6 +85,22 @@ void SoundFrequencyComponent::setup() {
     // Automatically start the microphone if not in passive mode
     this->microphone_source_->start();
   }
+
+  // The audio source only ever exposes MAX_FILL_DURATION_MS of audio at a time, which is typically less than one
+  // FFT window, so a full frame must be assembled from several fill/consume cycles. This buffer stages those
+  // partial frames until a complete window has accumulated. One extra sample guards the copy bounds below.
+  this->frame_buf_ = static_cast<int16_t *>(malloc((this->window_size_ + 1) * sizeof(int16_t)));
+  if (this->frame_buf_ == nullptr) {
+    ESP_LOGE(TAG, "Failed to allocate FFT frame buffer");
+    this->dsp_initialized_ = false;
+    this->work_ = nullptr;
+    this->window_ = nullptr;
+    this->accum_ = nullptr;
+    free(aligned_work);
+    free(window);
+    free(accum);
+    return;
+  }
 }
 
 void SoundFrequencyComponent::loop() {
@@ -124,6 +140,7 @@ void SoundFrequencyComponent::loop() {
       memset(this->accum_, 0, (this->window_size_ / 2) * sizeof(float));
       this->frame_count_ = 0;
       this->window_sample_count_ = 0;
+      this->frame_buf_offset_ = 0;
     }
 
     return;
@@ -168,41 +185,53 @@ void SoundFrequencyComponent::loop() {
     }
   }
 
-  // Expose a chunk of the ring buffer's internal storage - don't block to avoid slowing the main loop.
-  // pre_shift is ignored by RingBufferAudioSource (no intermediate transfer buffer to compact).
-  this->audio_source_->fill(0, false);
-
-  const uint32_t bytes_needed = stream_info.samples_to_bytes(this->window_size_);
-  if (this->audio_source_->available() < bytes_needed) {
-    // Not enough audio for a full FFT window yet - wait for more without consuming anything
-    this->diagnostic_log_ms_ = millis();
-    ESP_LOGW(TAG, "Starving: only %" PRIu32 " of %" PRIu32 " bytes (%" PRIu32 " samples) available in the ring buffer",
-             this->audio_source_->available(), bytes_needed,
-             stream_info.bytes_to_samples(this->audio_source_->available()));
-    return;
-  }
-
   const uint32_t samples_in_window = stream_info.ms_to_samples(this->measurement_duration_ms_);
 
-  // Process exactly one N-sample frame per loop invocation (one FFT per call bounds the CPU load)
-  if (!this->process_fft_frame_(reinterpret_cast<const int16_t *>(this->audio_source_->data()))) {
-    return;
-  }
-  this->audio_source_->consume(stream_info.samples_to_bytes(this->window_size_));
-  this->window_sample_count_ += this->window_size_;
-
-  if (this->band_valid_) {
-    // Emit the window when the measurement duration has been covered or the frame cap is reached
-    if (this->window_sample_count_ >= samples_in_window || this->frame_count_ >= MAX_FFT_FRAMES) {
-      ESP_LOGW(TAG, "Window emit: %" PRIu32 " frames, %" PRIu32 "/%" PRIu32 " samples (%" PRIu32 " ms target)",
-               this->frame_count_, this->window_sample_count_, samples_in_window, this->measurement_duration_ms_);
-      this->emit_window_();
+  // The audio source only exposes up to MAX_FILL_DURATION_MS of audio per fill() call, which is typically far less
+  // than a full FFT window. Assemble the measurement window by staging samples from successive fill/consume cycles
+  // into frame_buf_ until a whole N-sample frame has accumulated, then run one FFT on it. Bounded by both the
+  // available audio and MAX_FFT_FRAMES so a single loop() call never dominates CPU. This also keeps draining the
+  // ring buffer so the mic writer is not starved of space.
+  while (this->frame_count_ < MAX_FFT_FRAMES && this->window_sample_count_ < samples_in_window) {
+    if (this->frame_buf_offset_ >= this->window_size_) {
+      // A full frame has been staged - analyze it now
+      this->process_fft_frame_(this->frame_buf_);
+      this->frame_buf_offset_ = 0;
+      this->frame_count_++;
+      this->window_sample_count_ += this->window_size_;
     }
-  } else {
-    // Band invalid: drain the window so the counters stay bounded, but publish nothing new
-    memset(this->accum_, 0, (this->window_size_ / 2) * sizeof(float));
-    this->frame_count_ = 0;
-    this->window_sample_count_ = 0;
+
+    // Expose a chunk of the ring buffer's internal storage - don't block to avoid slowing the main loop.
+    // pre_shift is ignored by RingBufferAudioSource (no intermediate transfer buffer to compact).
+    this->audio_source_->fill(0, false);
+
+    const uint32_t samples_available = stream_info.bytes_to_samples(this->audio_source_->available());
+    if (samples_available == 0) {
+      break;  // no more audio available right now; wait for the mic to fill more
+    }
+    const int16_t *data = reinterpret_cast<const int16_t *>(this->audio_source_->mutable_data());
+
+    const uint32_t copies_needed = this->window_size_ - this->frame_buf_offset_;
+    const uint32_t copies_allowed = std::min(samples_available, copies_needed);
+    std::memcpy(this->frame_buf_ + this->frame_buf_offset_, data, stream_info.samples_to_bytes(copies_allowed));
+    this->audio_source_->consume(stream_info.samples_to_bytes(copies_allowed));
+    this->frame_buf_offset_ += copies_allowed;
+  }
+
+  if (this->frame_count_ > 0) {
+    if (this->band_valid_) {
+      // Emit the window when the measurement duration has been covered or the frame cap is reached
+      if (this->window_sample_count_ >= samples_in_window || this->frame_count_ >= MAX_FFT_FRAMES) {
+        ESP_LOGW(TAG, "Window emit: %" PRIu32 " frames, %" PRIu32 "/%" PRIu32 " samples (%" PRIu32 " ms target)",
+                 this->frame_count_, this->window_sample_count_, samples_in_window, this->measurement_duration_ms_);
+        this->emit_window_();
+      }
+    } else {
+      // Band invalid: drain the window so the counters stay bounded, but publish nothing new
+      memset(this->accum_, 0, (this->window_size_ / 2) * sizeof(float));
+      this->frame_count_ = 0;
+      this->window_sample_count_ = 0;
+    }
   }
 }
 
@@ -228,7 +257,6 @@ bool SoundFrequencyComponent::process_fft_frame_(const int16_t *samples) {
     const float im = this->work_[2 * k + 1];
     this->accum_[k] += re * re + im * im;
   }
-  this->frame_count_++;
 
   return true;
 }
@@ -359,7 +387,14 @@ bool SoundFrequencyComponent::start_() {
   return true;
 }
 
-void SoundFrequencyComponent::stop_() { this->audio_source_.reset(); }
+void SoundFrequencyComponent::stop_() {
+  this->audio_source_.reset();
+  if (this->frame_buf_ != nullptr) {
+    free(this->frame_buf_);
+    this->frame_buf_ = nullptr;
+  }
+  this->frame_buf_offset_ = 0;
+}
 
 }  // namespace esphome::sound_frequency
 
