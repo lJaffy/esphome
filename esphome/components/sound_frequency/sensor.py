@@ -1,7 +1,6 @@
 from esphome import automation
 import esphome.codegen as cg
 from esphome.components import microphone, sensor
-from esphome.components.esp32 import add_idf_component
 import esphome.config_validation as cv
 from esphome.const import (
     CONF_FREQUENCY,
@@ -36,12 +35,6 @@ StartAction = sound_frequency_ns.class_("StartAction", automation.Action)
 StopAction = sound_frequency_ns.class_("StopAction", automation.Action)
 
 
-def _validate_power_of_two(value):
-    if value != 0 and (value & (value - 1)) == 0:
-        return value
-    raise cv.Invalid("window_size must be a power of two")
-
-
 def _check_min_below_max(config):
     if config[CONF_MIN_FREQUENCY] >= config[CONF_MAX_FREQUENCY]:
         raise cv.Invalid(
@@ -69,13 +62,11 @@ CONFIG_SCHEMA = cv.All(
                 max_bits_per_sample=16,
             ),
             cv.Required(CONF_PASSIVE): cv.boolean,
-            cv.Optional(CONF_WINDOW_SIZE, default=1024): cv.All(
-                cv.int_range(min=64, max=4096), _validate_power_of_two
-            ),
+            cv.Optional(CONF_WINDOW_SIZE, default=1024): cv.int_range(min=64, max=4096),
             cv.Optional(CONF_MIN_FREQUENCY, default="100Hz"): cv.frequency,
             cv.Optional(CONF_MAX_FREQUENCY, default="12000Hz"): cv.frequency,
             cv.Optional(CONF_THRESHOLD_DB, default=-50.0): cv.All(
-                cv.float_, cv.Range(min=-80.0, max=0.0)
+                cv.float_, cv.Range(min=-80.0, max=0.0), cv.decibel
             ),
             cv.Optional(CONF_FREQUENCY): sensor.sensor_schema(
                 unit_of_measurement=UNIT_HERTZ,
@@ -92,7 +83,6 @@ CONFIG_SCHEMA = cv.All(
     ).extend(cv.COMPONENT_SCHEMA),
     _check_min_below_max,
     cv.only_on([PLATFORM_ESP32]),
-    cv.only_with_framework("esp-idf"),
 )
 
 
@@ -100,7 +90,6 @@ async def to_code(config):
     var = cg.new_Pvariable(config[CONF_ID])
     await cg.register_component(var, config)
 
-    add_idf_component(name="espressif/esp-dsp", ref="1.7.1")
     mic_source = await microphone.microphone_source_to_code(
         config[CONF_MICROPHONE], passive=config[CONF_PASSIVE]
     )
