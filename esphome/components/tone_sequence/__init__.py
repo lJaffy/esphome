@@ -87,7 +87,7 @@ async def to_code(config):
     cg.add(var.set_microphone_source(mic_source))
     cg.add(var.set_window_size(config[CONF_WINDOW_SIZE]))
     cg.add(var.set_tick_interval(config[CONF_TICK_INTERVAL]))
-    cg.add(var.set_pattern_duration_ms(config[CONF_PATTERN_DURATION]))
+    cg.add(var.set_pattern_duration(config[CONF_PATTERN_DURATION]))
     cg.add(var.set_tolerance_hz(config[CONF_TOLERANCE]))
     cg.add(var.set_threshold_db(config[CONF_THRESHOLD]))
 
