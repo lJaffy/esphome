@@ -91,13 +91,10 @@ async def to_code(config):
     cg.add(var.set_tolerance_hz(config[CONF_TOLERANCE]))
     cg.add(var.set_threshold_db(config[CONF_THRESHOLD]))
 
-    # Build the pattern vector
+    # Build the pattern vector inline
     tones = config[CONF_PATTERN]
-    #    tones_var = cg.new_Pvariable(cg.std_vector[cg.float_])
-    tones_var = cg.new_variable(cg.std_vector[cg.float_], cg.RawExpression("{}"))
-    for t in tones:
-        cg.add(tones_var.push_back(t))
-    cg.add(var.set_pattern(tones_var))
+    tones_init = ", ".join(f"{float(t)}f" for t in tones)
+    cg.add(var.set_pattern(cg.RawExpression(f"std::vector<float>{{{tones_init}}}")))
 
     detected = await binary_sensor.new_binary_sensor(config[CONF_DETECTED])
     cg.add(var.set_detected_sensor(detected))
