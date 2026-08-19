@@ -93,7 +93,8 @@ async def to_code(config):
 
     # Build the pattern vector
     tones = config[CONF_PATTERN]
-    tones_var = cg.new_Pvariable(cg.std_vector[cg.float_])
+    #    tones_var = cg.new_Pvariable(cg.std_vector[cg.float_])
+    tones_var = cg.new_variable(cg.std_vector[cg.float_], cg.RawExpression("{}"))
     for t in tones:
         cg.add(tones_var.push_back(t))
     cg.add(var.set_pattern(tones_var))
