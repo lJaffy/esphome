@@ -32,7 +32,9 @@ class ToneSequenceComponent : public Component {
   void set_threshold_db(float db) { this->threshold_db_ = db; }
   void set_detected_sensor(binary_sensor::BinarySensor *sensor) { this->detected_sensor_ = sensor; }
   void set_release_time(uint32_t ms) { this->release_time_ms_ = ms; }
-  uint32_t release_time_ms_{3000};  ///< how long the sensor stays True after detection
+  void set_dominance_db(float db) { this->dominance_db_ = db; }
+  void set_guard_offset_hz(uint16_t hz) { this->guard_offset_hz_ = hz; }
+  void set_min_match_span_ms(uint32_t ms) { this->min_match_span_ms_ = ms; }
 
   /// @brief Starts the microphone if not already running
   void start();
@@ -43,7 +45,7 @@ class ToneSequenceComponent : public Component {
   bool start_();
   void stop_();
 
-  /// Runs the Goertzel IIR for each expected tone over one N-sample frame,
+  /// Runs the Goertzel IIR for each filter over one N-sample frame,
   /// accumulating power into ``accum_``.
   void process_frame_(const int16_t *samples);
 
@@ -54,6 +56,9 @@ class ToneSequenceComponent : public Component {
   /// Advances or maintains the pattern-match state based on the current tick's
   /// dominant frequency and level.
   void evaluate_pattern_(float dominant_hz, float peak_db);
+
+  /// Latches the detection: sets the sensor True and arms the release timer.
+  void latch_detection_(uint32_t elapsed_ms);
 
   /// Resets the pattern state machine and publishes False on the detected sensor.
   void reset_pattern_();
@@ -68,6 +73,10 @@ class ToneSequenceComponent : public Component {
   uint32_t pattern_duration_ms_{2000};  ///< total deadline for the full sequence
   float tolerance_hz_{50.0f};           ///< ± Hz around each expected tone
   float threshold_db_{-50.0f};          ///< minimum dBFS for a tone to count
+  uint32_t release_time_ms_{3000};      ///< how long the sensor stays True after detection
+  float dominance_db_{6.0f};            ///< tone must be this many dB above guard-band avg
+  uint16_t guard_offset_hz_{150};       ///< guard filters sit ±this Hz from each unique tone
+  uint32_t min_match_span_ms_{1500};    ///< minimum time from first to last matched tone
 
   // ── Audio pipeline ──
   std::unique_ptr<audio::RingBufferAudioSource> audio_source_;
@@ -77,13 +86,16 @@ class ToneSequenceComponent : public Component {
 
   // ── Goertzel DSP state (allocated in setup) ──
   float *window_{nullptr};  ///< Hann window, N floats
-  float *accum_{nullptr};   ///< power accumulator, num_tones floats
-  float *g_v1_{nullptr};    ///< IIR state v1, num_tones floats
-  float *g_v2_{nullptr};    ///< IIR state v2, num_tones floats
-  float *g_c2_{nullptr};    ///< 2·cos(2πk/N) per tone, num_tones floats
+  float *accum_{nullptr};   ///< power accumulator, total_filters_ floats
+  float *g_v1_{nullptr};    ///< IIR state v1, total_filters_ floats
+  float *g_v2_{nullptr};    ///< IIR state v2, total_filters_ floats
+  float *g_c2_{nullptr};    ///< 2·cos(2πk/N) per filter, total_filters_ floats
 
-  uint32_t num_tones_{0};       ///< pattern_tones_.size()
-  float sample_rate_hz_{0.0f};  ///< runtime, from the microphone
+  uint32_t num_tones_{0};           ///< number of pattern-tone filters
+  uint32_t num_guards_{0};          ///< number of guard-band filters
+  uint32_t total_filters_{0};       ///< num_tones_ + num_guards_
+  std::vector<float> guard_freqs_;  ///< frequencies for the guard-band filters
+  float sample_rate_hz_{0.0f};      ///< runtime, from the microphone
 
   bool dsp_ready_{false};
 

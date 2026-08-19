@@ -24,6 +24,9 @@ CONF_TICK_INTERVAL = "tick_interval"
 CONF_PATTERN_DURATION = "pattern_duration"
 CONF_DETECTED = "detected"
 CONF_RELEASE_TIME = "release_time"
+CONF_DOMINANCE_DB = "dominance_db"
+CONF_MIN_MATCH_SPAN = "min_match_span"
+CONF_GUARD_OFFSET = "guard_offset"  # Hz offset for the guard-band filters
 
 # Add to the CONFIG_SCHEMA dict:
 
@@ -78,6 +81,19 @@ CONFIG_SCHEMA = cv.All(
                     min=cv.TimePeriod(milliseconds=500), max=cv.TimePeriod(minutes=5)
                 ),
             ),
+            cv.Optional(CONF_DOMINANCE_DB, default=6.0): cv.All(
+                cv.positive_float, cv.Range(min=0.0, max=30.0)
+            ),
+            cv.Optional(CONF_GUARD_OFFSET, default=150): cv.All(
+                cv.positive_int, cv.Range(min=20, max=500)
+            ),
+            cv.Optional(CONF_MIN_MATCH_SPAN): cv.All(
+                cv.positive_time_period_milliseconds,
+                cv.Range(
+                    min=cv.TimePeriod(milliseconds=100),
+                    max=cv.TimePeriod(seconds=60),
+                ),
+            ),
         }
     ).extend(cv.COMPONENT_SCHEMA),
     cv.only_on([PLATFORM_ESP32]),
@@ -109,6 +125,16 @@ async def to_code(config):
     detected = await binary_sensor.new_binary_sensor(config[CONF_DETECTED])
     cg.add(var.set_detected_sensor(detected))
     cg.add(var.set_release_time(config[CONF_RELEASE_TIME]))
+    cg.add(var.set_dominance_db(config[CONF_DOMINANCE_DB]))
+    cg.add(var.set_guard_offset_hz(config[CONF_GUARD_OFFSET]))
+
+    # min_match_span defaults to 75 % of pattern_duration if not set
+    if config.get(CONF_MIN_MATCH_SPAN) is not None:
+        cg.add(var.set_min_match_span_ms(config[CONF_MIN_MATCH_SPAN]))
+    else:
+        # 75 % of pattern_duration
+        pgm = f"static_cast<uint32_t>({config[CONF_PATTERN_DURATION].total_milliseconds} * 0.75f)"
+        cg.add(var.set_min_match_span_ms(cg.RawExpression(pgm)))
 
 
 # ── Actions ──

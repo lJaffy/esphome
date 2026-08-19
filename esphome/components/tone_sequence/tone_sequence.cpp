@@ -32,9 +32,14 @@ void ToneSequenceComponent::dump_config() {
                 "  Pattern Duration: %" PRIu32 " ms\n"
                 "  Tolerance: ±%.1f Hz\n"
                 "  Threshold: %.1f dB\n"
+                "  Dominance: %.1f dB\n"
+                "  Guard Offset: %" PRIu16 " Hz\n"
+                "  Min Match Span: %" PRIu32 " ms\n"
+                "  Release Time: %" PRIu32 " ms\n"
                 "  Tones (%lu):",
                 this->window_size_, this->tick_interval_ms_, this->pattern_duration_ms_, this->tolerance_hz_,
-                this->threshold_db_, (unsigned long) this->pattern_tones_.size());
+                this->threshold_db_, this->dominance_db_, this->guard_offset_hz_, this->min_match_span_ms_,
+                this->release_time_ms_, (unsigned long) this->pattern_tones_.size());
   for (size_t i = 0; i < this->pattern_tones_.size(); ++i) {
     ESP_LOGCONFIG(TAG, "    [%u] = %.1f Hz", (unsigned) i, this->pattern_tones_[i]);
   }
@@ -62,7 +67,41 @@ void ToneSequenceComponent::setup() {
     return;
   }
 
-  // Hann window (N floats)
+  // ── Build the guard-band frequency list ──
+  // For each *unique* pattern tone, add ±guard_offset_hz references.
+  this->guard_freqs_.clear();
+  for (uint32_t i = 0; i < this->num_tones_; ++i) {
+    const float f = this->pattern_tones_[i];
+    // Skip if this exact frequency was already added
+    bool seen = false;
+    for (uint32_t j = 0; j < i; ++j) {
+      if (this->pattern_tones_[j] == f) {
+        seen = true;
+        break;
+      }
+    }
+    if (seen)
+      continue;
+
+    const float lo = f - this->guard_offset_hz_;
+    const float hi = f + this->guard_offset_hz_;
+    if (lo > 20.0f) {
+      this->guard_freqs_.push_back(lo);
+    }
+    if (hi < 20000.0f) {
+      this->guard_freqs_.push_back(hi);
+    }
+  }
+  this->num_guards_ = this->guard_freqs_.size();
+  this->total_filters_ = this->num_tones_ + this->num_guards_;
+
+  ESP_LOGI(TAG, "Guard-band filters: %lu (offset ±%" PRIu16 " Hz)", (unsigned long) this->num_guards_,
+           this->guard_offset_hz_);
+  for (size_t g = 0; g < this->guard_freqs_.size(); ++g) {
+    ESP_LOGD(TAG, "  guard[%lu] = %.1f Hz", (unsigned long) g, this->guard_freqs_[g]);
+  }
+
+  // ── Hann window (N floats) ──
   float *window = static_cast<float *>(malloc(n * sizeof(float)));
   if (window == nullptr) {
     ESP_LOGE(TAG, "Failed to allocate window buffer (%" PRIu32 " bytes)", n * sizeof(float));
@@ -73,18 +112,19 @@ void ToneSequenceComponent::setup() {
   }
   this->window_ = window;
 
-  // Goertzel buffers (one slot per expected tone)
-  const uint32_t nt = this->num_tones_;
-  float *accum = static_cast<float *>(malloc(nt * sizeof(float)));
-  float *v1 = static_cast<float *>(malloc(nt * sizeof(float)));
-  float *v2 = static_cast<float *>(malloc(nt * sizeof(float)));
-  float *c2 = static_cast<float *>(malloc(nt * sizeof(float)));
+  // ── Goertzel buffers (one slot per filter: tones + guards) ──
+  const uint32_t nf = this->total_filters_;
+  float *accum = static_cast<float *>(malloc(nf * sizeof(float)));
+  float *v1 = static_cast<float *>(malloc(nf * sizeof(float)));
+  float *v2 = static_cast<float *>(malloc(nf * sizeof(float)));
+  float *c2 = static_cast<float *>(malloc(nf * sizeof(float)));
   if (accum == nullptr || v1 == nullptr || v2 == nullptr || c2 == nullptr) {
     free(accum);
     free(v1);
     free(v2);
     free(c2);
     free(window);
+    this->window_ = nullptr;
     ESP_LOGE(TAG, "Failed to allocate Goertzel buffers");
     return;
   }
@@ -93,7 +133,7 @@ void ToneSequenceComponent::setup() {
   this->g_v1_ = v1;
   this->g_v2_ = v2;
   this->g_c2_ = c2;
-  memset(accum, 0, nt * sizeof(float));
+  memset(accum, 0, nf * sizeof(float));
 
   // The Goertzel coefficients (2·cos(2πk/N)) depend on the sample rate,
   // which is only known at runtime. We store the target frequencies and
@@ -148,12 +188,33 @@ void ToneSequenceComponent::loop() {
   if (this->sample_rate_hz_ == 0.0f) {
     this->sample_rate_hz_ = static_cast<float>(stream_info.get_sample_rate());
     const uint32_t n = this->window_size_;
+    const float nyquist = this->sample_rate_hz_ / 2.0f;
+
+    // Pattern-tone coefficients (indices 0 .. num_tones_-1)
     for (uint32_t t = 0; t < this->num_tones_; ++t) {
-      const float k = (this->pattern_tones_[t] * static_cast<float>(n)) / this->sample_rate_hz_;
+      float freq = this->pattern_tones_[t];
+      if (freq < 20.0f)
+        freq = 20.0f;
+      if (freq > nyquist - 20.0f)
+        freq = nyquist - 20.0f;
+      const float k = (freq * static_cast<float>(n)) / this->sample_rate_hz_;
       this->g_c2_[t] = 2.0f * cosf(2.0f * (float) M_PI * k / static_cast<float>(n));
     }
-    ESP_LOGI(TAG, "Goertzel init: %lu tones, N=%" PRIu16 ", fs=%" PRIu32 " Hz", (unsigned long) this->num_tones_,
-             this->window_size_, (uint32_t) stream_info.get_sample_rate());
+
+    // Guard-band coefficients (indices num_tones_ .. total_filters_-1)
+    for (uint32_t g = 0; g < this->num_guards_; ++g) {
+      float freq = this->guard_freqs_[g];
+      if (freq < 20.0f)
+        freq = 20.0f;
+      if (freq > nyquist - 20.0f)
+        freq = nyquist - 20.0f;
+      const float k = (freq * static_cast<float>(n)) / this->sample_rate_hz_;
+      this->g_c2_[this->num_tones_ + g] = 2.0f * cosf(2.0f * (float) M_PI * k / static_cast<float>(n));
+    }
+
+    ESP_LOGI(TAG, "Goertzel init: %lu tones + %lu guards, N=%" PRIu16 ", fs=%" PRIu32 " Hz",
+             (unsigned long) this->num_tones_, (unsigned long) this->num_guards_, this->window_size_,
+             (uint32_t) stream_info.get_sample_rate());
   }
 
   const uint32_t samples_in_tick = stream_info.ms_to_samples(this->tick_interval_ms_);
@@ -192,15 +253,15 @@ void ToneSequenceComponent::loop() {
     if (this->detected_sensor_ != nullptr) {
       this->detected_sensor_->publish_state(false);
     }
-    ESP_LOGD(TAG, "Detection released after %lu ms hold", (unsigned long) this->release_time_ms_);
+    ESP_LOGD(TAG, "Detection released after %" PRIu32 " ms hold", this->release_time_ms_);
   }
 
   // ── Pattern deadline check (runs every loop, not just on tick) ──
   if (this->pattern_active_) {
     const uint32_t elapsed = millis() - this->pattern_start_ms_;
     if (elapsed > this->pattern_duration_ms_) {
-      ESP_LOGD(TAG, "Pattern timed out after %lu ms (matched %u/%lu)", (unsigned long) elapsed, this->match_index_,
-               (unsigned long) this->num_tones_);
+      ESP_LOGD(TAG, "Pattern timed out after %" PRIu32 " ms (matched %u/%lu)", (unsigned long) elapsed,
+               this->match_index_, (unsigned long) this->num_tones_);
       this->reset_pattern_();
     }
   }
@@ -212,29 +273,29 @@ void ToneSequenceComponent::loop() {
 
 void ToneSequenceComponent::process_frame_(const int16_t *samples) {
   const uint32_t n = this->window_size_;
-  const uint32_t nt = this->num_tones_;
+  const uint32_t nf = this->total_filters_;
 
   // Reset IIR state
-  for (uint32_t t = 0; t < nt; ++t) {
+  for (uint32_t t = 0; t < nf; ++t) {
     this->g_v1_[t] = 0.0f;
     this->g_v2_[t] = 0.0f;
   }
 
   // IIR recursion: v[n] = c2·v[n-1] - v[n-2] + x[n]
-  // Process sample-by-sample; all tones share the same input.
+  // Process sample-by-sample; all filters share the same input.
   for (uint32_t i = 0; i < n; ++i) {
     const float x = (static_cast<float>(samples[i]) / 32768.0f) * this->window_[i];
-    for (uint32_t t = 0; t < nt; ++t) {
+    for (uint32_t t = 0; t < nf; ++t) {
       const float v = this->g_c2_[t] * this->g_v1_[t] - this->g_v2_[t] + x;
       this->g_v2_[t] = this->g_v1_[t];
       this->g_v1_[t] = v;
     }
   }
 
-  // Optimized magnitude-squared (no complex arithmetic, no atan2):
+  // Magnitude-squared (no complex arithmetic, no atan2):
   //   |X[k]|² = v1² + v2² - c2·v1·v2
   // Accumulate power across frames (periodogram averaging within the tick).
-  for (uint32_t t = 0; t < nt; ++t) {
+  for (uint32_t t = 0; t < nf; ++t) {
     const float v1 = this->g_v1_[t];
     const float v2 = this->g_v2_[t];
     this->accum_[t] += v1 * v1 + v2 * v2 - this->g_c2_[t] * v1 * v2;
@@ -247,22 +308,20 @@ void ToneSequenceComponent::process_frame_(const int16_t *samples) {
 
 void ToneSequenceComponent::emit_tick_() {
   const uint32_t n = this->window_size_;
-  const uint32_t nt = this->num_tones_;
+  const float ref = static_cast<float>(n);
 
   // Average over the frames in this tick
   if (this->frame_count_ > 0) {
     const float inv = 1.0f / static_cast<float>(this->frame_count_);
-    for (uint32_t t = 0; t < nt; ++t) {
+    for (uint32_t t = 0; t < this->total_filters_; ++t) {
       this->accum_[t] *= inv;
     }
   }
 
-  // Find the strongest tone above threshold
+  // ── Find the strongest pattern tone ──
   float peak_db = -300.0f;
   uint32_t peak_idx = 0;
-  const float ref = static_cast<float>(n);
-
-  for (uint32_t t = 0; t < nt; ++t) {
+  for (uint32_t t = 0; t < this->num_tones_; ++t) {
     const float p = this->accum_[t];
     const float db = (p > 0.0f) ? 10.0f * log10f(p / ref) : -300.0f;
     if (db > peak_db) {
@@ -271,15 +330,36 @@ void ToneSequenceComponent::emit_tick_() {
     }
   }
 
-  // The dominant frequency is the expected tone at peak_idx (since each Goertzel
-  // filter is tuned to exactly one pattern tone).
-  float dominant_hz = this->pattern_tones_[peak_idx];
+  // ── Compute guard-band average (the "neighbouring" noise floor) ──
+  float guard_sum = 0.0f;
+  uint32_t guard_count = 0;
+  for (uint32_t g = 0; g < this->num_guards_; ++g) {
+    const float p = this->accum_[this->num_tones_ + g];
+    if (p > 0.0f) {
+      guard_sum += 10.0f * log10f(p / ref);
+      guard_count++;
+    }
+  }
+  const float guard_avg_db = (guard_count > 0) ? guard_sum / static_cast<float>(guard_count) : -300.0f;
+
+  // ── Dominance test ──
+  // The peak tone must be at least dominance_db_ above the guard-band average.
+  // Broadband noise (talking, music) raises both the peak and the guards equally,
+  // so dominance stays low. A pure chime at 500 Hz will have low energy at
+  // 350/650 Hz, giving high dominance.
+  if (peak_db >= this->threshold_db_ && (peak_db - guard_avg_db) < this->dominance_db_) {
+    ESP_LOGD(TAG, "Tick rejected: peak %.1f dB but only %.1f dB above guard avg (%.1f dB)", peak_db,
+             peak_db - guard_avg_db, guard_avg_db);
+    peak_db = -300.0f;  // treat as silence for the state machine
+  }
+
+  float dominant_hz = (peak_db > -300.0f) ? this->pattern_tones_[peak_idx] : 0.0f;
 
   // Feed the state machine
   this->evaluate_pattern_(dominant_hz, peak_db);
 
   // Reset for next tick
-  memset(this->accum_, 0, nt * sizeof(float));
+  memset(this->accum_, 0, this->total_filters_ * sizeof(float));
   this->frame_count_ = 0;
   this->tick_sample_count_ = 0;
 }
@@ -287,20 +367,33 @@ void ToneSequenceComponent::emit_tick_() {
 void ToneSequenceComponent::evaluate_pattern_(float dominant_hz, float peak_db) {
   if (!this->pattern_active_) {
     // ── IDLE: waiting for the first tone in the sequence ──
-    if (peak_db >= this->threshold_db_) {
-      // Is the dominant tone close to pattern_tones_[0]?
-      if (std::fabs(dominant_hz - this->pattern_tones_[0]) <= this->tolerance_hz_) {
-        this->pattern_active_ = true;
-        this->match_index_ = 1;
-        this->pattern_start_ms_ = millis();
-        ESP_LOGI(TAG, "Pattern started: tone 1/%lu matched (%.1f Hz, %.1f dB)", (unsigned long) this->num_tones_,
-                 dominant_hz, peak_db);
+    if (peak_db >= this->threshold_db_ && std::fabs(dominant_hz - this->pattern_tones_[0]) <= this->tolerance_hz_) {
+      this->pattern_active_ = true;
+      this->match_index_ = 1;
+      this->pattern_start_ms_ = millis();
+      ESP_LOGI(TAG, "Pattern started: tone 1/%lu matched (%.1f Hz, %.1f dB)", (unsigned long) this->num_tones_,
+               dominant_hz, peak_db);
+    }
+    return;
+  }
+
+  // ── ALL TONES MATCHED: waiting for min_match_span to elapse ──
+  if (this->match_index_ >= this->num_tones_) {
+    const uint32_t elapsed = millis() - this->pattern_start_ms_;
+    if (elapsed >= this->min_match_span_ms_) {
+      this->latch_detection_(elapsed);
+    } else {
+      // Require the tone to still be present; reset if it drops out
+      if (peak_db < this->threshold_db_) {
+        ESP_LOGD(TAG, "Pattern incomplete – tone dropped at %" PRIu32 " ms (need %" PRIu32 "), resetting",
+                 (unsigned long) elapsed, (unsigned long) this->min_match_span_ms_);
+        this->reset_pattern_();
       }
     }
     return;
   }
 
-  // ── MATCHING ──
+  // ── NORMAL MATCHING ──
   if (peak_db < this->threshold_db_) {
     // Silence – simply wait, no penalty
     return;
@@ -316,25 +409,32 @@ void ToneSequenceComponent::evaluate_pattern_(float dominant_hz, float peak_db) 
 
     if (this->match_index_ >= this->num_tones_) {
       const uint32_t elapsed = millis() - this->pattern_start_ms_;
-      ESP_LOGI(TAG, "PATTERN DETETECTED in %lu ms (%lu tones)", (unsigned long) elapsed,
-               (unsigned long) this->num_tones_);
-
-      // Latch True and set a release deadline
-      this->detected_latched_ = true;
-      this->release_until_ms_ = millis() + this->release_time_ms_;
-
-      if (this->detected_sensor_ != nullptr) {
-        this->detected_sensor_->publish_state(true);
+      if (elapsed >= this->min_match_span_ms_) {
+        // Span already met – latch immediately
+        this->latch_detection_(elapsed);
       }
-
-      // Reset the matching state but do NOT publish false here
-      this->pattern_active_ = false;
-      this->match_index_ = 0;
-      return;
+      // else: match_index_ == num_tones_; next tick enters the "waiting" block above
     }
   }
   // Wrong tone: ignored – do not reset, do not advance.
 }
+
+void ToneSequenceComponent::latch_detection_(uint32_t elapsed_ms) {
+  ESP_LOGI(TAG, "PATTERN DETECTED in %" PRIu32 " ms (%lu tones)", (unsigned long) elapsed_ms,
+           (unsigned long) this->num_tones_);
+
+  this->detected_latched_ = true;
+  this->release_until_ms_ = millis() + this->release_time_ms_;
+
+  if (this->detected_sensor_ != nullptr) {
+    this->detected_sensor_->publish_state(true);
+  }
+
+  // Reset the matching state but do NOT publish false here
+  this->pattern_active_ = false;
+  this->match_index_ = 0;
+}
+
 void ToneSequenceComponent::reset_pattern_() {
   this->pattern_active_ = false;
   this->match_index_ = 0;
@@ -367,6 +467,7 @@ void ToneSequenceComponent::stop() {
 // ──────────────────────────────────────────────
 //  Internal buffer management
 // ──────────────────────────────────────────────
+
 bool ToneSequenceComponent::start_() {
   if (this->audio_source_ != nullptr) {
     return true;
