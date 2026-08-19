@@ -6,7 +6,7 @@
 #include <vector>
 
 #include "esphome/components/audio/audio_transfer_buffer.h"
-#include "esphome/components/binary_sensor/binary_sensor.h"
+//#include "esphome/components/binary_sensor/binary_sensor.h"
 #include "esphome/components/microphone/microphone_source.h"
 #include "esphome/components/ring_buffer/ring_buffer.h"
 #include "esphome/core/automation.h"
