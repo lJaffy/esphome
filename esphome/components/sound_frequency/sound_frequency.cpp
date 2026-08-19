@@ -85,22 +85,6 @@ void SoundFrequencyComponent::setup() {
     // Automatically start the microphone if not in passive mode
     this->microphone_source_->start();
   }
-
-  // The audio source only ever exposes MAX_FILL_DURATION_MS of audio at a time, which is typically less than one
-  // FFT window, so a full frame must be assembled from several fill/consume cycles. This buffer stages those
-  // partial frames until a complete window has accumulated. One extra sample guards the copy bounds below.
-  this->frame_buf_ = static_cast<int16_t *>(malloc((this->window_size_ + 1) * sizeof(int16_t)));
-  if (this->frame_buf_ == nullptr) {
-    ESP_LOGE(TAG, "Failed to allocate FFT frame buffer");
-    this->dsp_initialized_ = false;
-    this->work_ = nullptr;
-    this->window_ = nullptr;
-    this->accum_ = nullptr;
-    free(aligned_work);
-    free(window);
-    free(accum);
-    return;
-  }
 }
 
 void SoundFrequencyComponent::loop() {
@@ -383,6 +367,21 @@ bool SoundFrequencyComponent::start_() {
   }
 
   this->ring_buffer_ = temp_ring_buffer;
+
+  // The audio source only ever exposes MAX_FILL_DURATION_MS of audio at a time, which is typically less than one
+  // FFT window, so a full frame must be assembled from several fill/consume cycles. This buffer stages those
+  // partial frames until a complete window has accumulated. One extra sample guards the copy bounds below. It is
+  // (re)allocated here - not in setup() - because stop_() frees it when the microphone stops, and it must be
+  // restored whenever the audio source is created again.
+  this->frame_buf_ = static_cast<int16_t *>(malloc((this->window_size_ + 1) * sizeof(int16_t)));
+  if (this->frame_buf_ == nullptr) {
+    ESP_LOGE(TAG, "Failed to allocate FFT frame buffer");
+    this->audio_source_.reset();
+    this->ring_buffer_.reset();
+    this->status_momentary_error("frame_buf", 15000);
+    return false;
+  }
+
   this->status_clear_error();
   return true;
 }
