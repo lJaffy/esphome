@@ -152,7 +152,7 @@ void ToneSequenceComponent::loop() {
       const float k = (this->pattern_tones_[t] * static_cast<float>(n)) / this->sample_rate_hz_;
       this->g_c2_[t] = 2.0f * cosf(2.0f * (float) M_PI * k / static_cast<float>(n));
     }
-    ESP_LOGI(TAG, "Goertzel init: %" PRIu32 " tones, N=%" PRIu32 ", fs=%" PRIu32 " Hz", this->num_tones_,
+    ESP_LOGI(TAG, "Goertzel init: %lu tones, N=%" PRIu16 ", fs=%" PRIu32 " Hz", (unsigned long) this->num_tones_,
              this->window_size_, (uint32_t) stream_info.get_sample_rate());
   }
 
@@ -350,7 +350,6 @@ void ToneSequenceComponent::stop() {
 // ──────────────────────────────────────────────
 //  Internal buffer management
 // ──────────────────────────────────────────────
-
 bool ToneSequenceComponent::start_() {
   if (this->audio_source_ != nullptr) {
     return true;
@@ -361,7 +360,7 @@ bool ToneSequenceComponent::start_() {
 
   this->ring_buffer_.reset();
   const size_t rb_size = (stream_info.ms_to_bytes(RING_BUFFER_DURATION_MS) / bpf) * bpf;
-  auto rb = ring_buffer::RingBuffer::create(rb_size);
+  std::shared_ptr<ring_buffer::RingBuffer> rb = ring_buffer::RingBuffer::create(rb_size);
   if (rb == nullptr) {
     this->status_momentary_error("ring_buffer", 15000);
     return false;
@@ -373,7 +372,7 @@ bool ToneSequenceComponent::start_() {
     this->status_momentary_error("audio_source", 15000);
     return false;
   }
-  this->ring_buffer_ = rb;
+  this->ring_buffer_ = rb;  // shared_ptr → weak_ptr works fine
 
   this->frame_buf_ = static_cast<int16_t *>(malloc((this->window_size_ + 1) * sizeof(int16_t)));
   if (this->frame_buf_ == nullptr) {
