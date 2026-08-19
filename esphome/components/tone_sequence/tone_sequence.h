@@ -31,6 +31,8 @@ class ToneSequenceComponent : public Component {
   void set_tolerance_hz(float hz) { this->tolerance_hz_ = hz; }
   void set_threshold_db(float db) { this->threshold_db_ = db; }
   void set_detected_sensor(binary_sensor::BinarySensor *sensor) { this->detected_sensor_ = sensor; }
+  void set_release_time(uint32_t ms) { this->release_time_ms_ = ms; }
+  uint32_t release_time_ms_{3000};  ///< how long the sensor stays True after detection
 
   /// @brief Starts the microphone if not already running
   void start();
@@ -66,8 +68,6 @@ class ToneSequenceComponent : public Component {
   uint32_t pattern_duration_ms_{2000};  ///< total deadline for the full sequence
   float tolerance_hz_{50.0f};           ///< ± Hz around each expected tone
   float threshold_db_{-50.0f};          ///< minimum dBFS for a tone to count
-  void set_release_time(uint32_t ms) { this->release_time_ms_ = ms; }
-  uint32_t release_time_ms_{3000};  ///< how long the sensor stays True after detection
 
   // ── Audio pipeline ──
   std::unique_ptr<audio::RingBufferAudioSource> audio_source_;
