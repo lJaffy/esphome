@@ -105,10 +105,11 @@ class ToneSequenceComponent : public Component {
 
   // ── Pattern state machine ──
   bool pattern_active_{false};
-  uint8_t match_index_{0};        ///< which tone we are waiting for (0-based)
-  uint32_t pattern_start_ms_{0};  ///< millis() when tone 0 first matched
-  uint32_t release_until_ms_{0};  ///< millis() deadline for holding True
-  bool detected_latched_{false};  ///< true while the sensor is in its hold period
+  uint8_t match_index_{0};         ///< which tone we are waiting for (0-based)
+  uint32_t pattern_start_ms_{0};   ///< millis() when tone 0 first matched
+  bool need_falling_edge_{false};  ///< true until the last-matched tone drops out
+  uint32_t release_until_ms_{0};   ///< millis() deadline for holding True
+  bool detected_latched_{false};   ///< true while the sensor is in its hold period
 
   // ── Diagnostics ──
   uint32_t diag_log_ms_{0};

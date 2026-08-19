@@ -135,9 +135,6 @@ void ToneSequenceComponent::setup() {
   this->g_c2_ = c2;
   memset(accum, 0, nf * sizeof(float));
 
-  // The Goertzel coefficients (2·cos(2πk/N)) depend on the sample rate,
-  // which is only known at runtime. We store the target frequencies and
-  // compute the coefficients on the first loop() call.
   this->sample_rate_hz_ = 0.0f;
   this->dsp_ready_ = true;
 
@@ -282,7 +279,6 @@ void ToneSequenceComponent::process_frame_(const int16_t *samples) {
   }
 
   // IIR recursion: v[n] = c2·v[n-1] - v[n-2] + x[n]
-  // Process sample-by-sample; all filters share the same input.
   for (uint32_t i = 0; i < n; ++i) {
     const float x = (static_cast<float>(samples[i]) / 32768.0f) * this->window_[i];
     for (uint32_t t = 0; t < nf; ++t) {
@@ -292,9 +288,7 @@ void ToneSequenceComponent::process_frame_(const int16_t *samples) {
     }
   }
 
-  // Magnitude-squared (no complex arithmetic, no atan2):
-  //   |X[k]|² = v1² + v2² - c2·v1·v2
-  // Accumulate power across frames (periodogram averaging within the tick).
+  // Magnitude-squared: |X[k]|² = v1² + v2² - c2·v1·v2
   for (uint32_t t = 0; t < nf; ++t) {
     const float v1 = this->g_v1_[t];
     const float v2 = this->g_v2_[t];
@@ -330,7 +324,7 @@ void ToneSequenceComponent::emit_tick_() {
     }
   }
 
-  // ── Compute guard-band average (the "neighbouring" noise floor) ──
+  // ── Compute guard-band average ──
   float guard_sum = 0.0f;
   uint32_t guard_count = 0;
   for (uint32_t g = 0; g < this->num_guards_; ++g) {
@@ -343,14 +337,10 @@ void ToneSequenceComponent::emit_tick_() {
   const float guard_avg_db = (guard_count > 0) ? guard_sum / static_cast<float>(guard_count) : -300.0f;
 
   // ── Dominance test ──
-  // The peak tone must be at least dominance_db_ above the guard-band average.
-  // Broadband noise (talking, music) raises both the peak and the guards equally,
-  // so dominance stays low. A pure chime at 500 Hz will have low energy at
-  // 350/650 Hz, giving high dominance.
   if (peak_db >= this->threshold_db_ && (peak_db - guard_avg_db) < this->dominance_db_) {
     ESP_LOGD(TAG, "Tick rejected: peak %.1f dB but only %.1f dB above guard avg (%.1f dB)", peak_db,
              peak_db - guard_avg_db, guard_avg_db);
-    peak_db = -300.0f;  // treat as silence for the state machine
+    peak_db = -300.0f;
   }
 
   float dominant_hz = (peak_db > -300.0f) ? this->pattern_tones_[peak_idx] : 0.0f;
@@ -364,60 +354,101 @@ void ToneSequenceComponent::emit_tick_() {
   this->tick_sample_count_ = 0;
 }
 
+// ──────────────────────────────────────────────
+//  Pattern state machine
+// ──────────────────────────────────────────────
+
 void ToneSequenceComponent::evaluate_pattern_(float dominant_hz, float peak_db) {
+  // ═══════════════════════════════════════════════════════════
+  //  STATE: IDLE – waiting for the first tone in the sequence
+  // ═══════════════════════════════════════════════════════════
   if (!this->pattern_active_) {
-    // ── IDLE: waiting for the first tone in the sequence ──
     if (peak_db >= this->threshold_db_ && std::fabs(dominant_hz - this->pattern_tones_[0]) <= this->tolerance_hz_) {
       this->pattern_active_ = true;
       this->match_index_ = 1;
       this->pattern_start_ms_ = millis();
+      this->need_falling_edge_ = true;  // must drop out before tone 1 can match
       ESP_LOGI(TAG, "Pattern started: tone 1/%lu matched (%.1f Hz, %.1f dB)", (unsigned long) this->num_tones_,
                dominant_hz, peak_db);
     }
     return;
   }
 
-  // ── ALL TONES MATCHED: waiting for min_match_span to elapse ──
+  // ═══════════════════════════════════════════════════════════
+  //  STATE: SPAN WAIT – all tones matched, waiting for min_match_span
+  // ═══════════════════════════════════════════════════════════
   if (this->match_index_ >= this->num_tones_) {
     const uint32_t elapsed = millis() - this->pattern_start_ms_;
     if (elapsed >= this->min_match_span_ms_) {
       this->latch_detection_(elapsed);
-    } else {
-      // Require the tone to still be present; reset if it drops out
-      if (peak_db < this->threshold_db_) {
-        ESP_LOGD(TAG, "Pattern incomplete – tone dropped at %" PRIu32 " ms (need %" PRIu32 "), resetting",
-                 (unsigned long) elapsed, (unsigned long) this->min_match_span_ms_);
-        this->reset_pattern_();
-      }
     }
+    // Note: we do NOT require the tone to still be present here.
+    // The pattern has been fully validated (all tones + falling edges).
+    // We're just waiting to confirm the total span meets the minimum.
     return;
   }
 
-  // ── NORMAL MATCHING ──
+  // ═══════════════════════════════════════════════════════════
+  //  STATE: WAITING FOR FALLING EDGE
+  //  The previously-matched tone must drop out (silence or transition
+  //  to a different frequency) before the next tone can register.
+  // ═══════════════════════════════════════════════════════════
+  if (this->need_falling_edge_) {
+    // What frequency did we just match?
+    const uint8_t prev_idx = static_cast<uint8_t>(this->match_index_ - 1);
+    const float prev_freq = this->pattern_tones_[prev_idx];
+
+    // Is the previously-matched tone still the dominant one?
+    const bool prev_still_present =
+        (peak_db >= this->threshold_db_) && (std::fabs(dominant_hz - prev_freq) <= this->tolerance_hz_);
+
+    if (prev_still_present) {
+      // Tone has not dropped yet – keep waiting. A constant drone
+      // will be stuck here until pattern_duration times out.
+      return;
+    }
+
+    // Falling edge detected! The tone either went silent or
+    // transitioned to a different frequency.
+    this->need_falling_edge_ = false;
+    ESP_LOGD(TAG, "Falling edge detected after tone %u/%lu (now: %.1f dB, dominant %.1f Hz)", (unsigned) (prev_idx + 1),
+             (unsigned long) this->num_tones_, peak_db, dominant_hz);
+
+    // Don't return – fall through to check if the current tick
+    // already contains the next expected tone (e.g. 500→1000 transition
+    // with no silent gap in between).
+  }
+
+  // ═══════════════════════════════════════════════════════════
+  //  STATE: MATCHING – waiting for the next tone (falling edge confirmed)
+  // ═══════════════════════════════════════════════════════════
   if (peak_db < this->threshold_db_) {
-    // Silence – simply wait, no penalty
+    // Silence – simply wait for the next tone to appear
     return;
   }
 
-  // A tone is present. Check if it is the expected next one.
   const float expected = this->pattern_tones_[this->match_index_];
   if (std::fabs(dominant_hz - expected) <= this->tolerance_hz_) {
-    // Correct tone – advance
     ESP_LOGD(TAG, "Tone %lu/%lu matched (%.1f Hz, %.1f dB)", (unsigned long) (this->match_index_ + 1),
              (unsigned long) this->num_tones_, dominant_hz, peak_db);
     this->match_index_++;
+    this->need_falling_edge_ = true;  // require falling edge before the NEXT tone
 
     if (this->match_index_ >= this->num_tones_) {
+      // All tones matched. Check if span is already satisfied.
       const uint32_t elapsed = millis() - this->pattern_start_ms_;
       if (elapsed >= this->min_match_span_ms_) {
-        // Span already met – latch immediately
         this->latch_detection_(elapsed);
       }
-      // else: match_index_ == num_tones_; next tick enters the "waiting" block above
+      // else: next tick enters the SPAN WAIT state
     }
   }
   // Wrong tone: ignored – do not reset, do not advance.
 }
+
+// ──────────────────────────────────────────────
+//  Latch / reset helpers
+// ──────────────────────────────────────────────
 
 void ToneSequenceComponent::latch_detection_(uint32_t elapsed_ms) {
   ESP_LOGI(TAG, "PATTERN DETECTED in %" PRIu32 " ms (%lu tones)", (unsigned long) elapsed_ms,
@@ -430,15 +461,15 @@ void ToneSequenceComponent::latch_detection_(uint32_t elapsed_ms) {
     this->detected_sensor_->publish_state(true);
   }
 
-  // Reset the matching state but do NOT publish false here
   this->pattern_active_ = false;
   this->match_index_ = 0;
+  this->need_falling_edge_ = false;
 }
 
 void ToneSequenceComponent::reset_pattern_() {
   this->pattern_active_ = false;
   this->match_index_ = 0;
-  // Only release the sensor if we're not currently in a hold period
+  this->need_falling_edge_ = false;
   if (!this->detected_latched_ && this->detected_sensor_ != nullptr) {
     this->detected_sensor_->publish_state(false);
   }
@@ -490,7 +521,7 @@ bool ToneSequenceComponent::start_() {
     this->status_momentary_error("audio_source", 15000);
     return false;
   }
-  this->ring_buffer_ = rb;  // shared_ptr → weak_ptr works fine
+  this->ring_buffer_ = rb;
 
   this->frame_buf_ = static_cast<int16_t *>(malloc((this->window_size_ + 1) * sizeof(int16_t)));
   if (this->frame_buf_ == nullptr) {
