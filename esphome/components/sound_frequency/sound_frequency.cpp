@@ -4,7 +4,6 @@
 
 #include <sys/param.h>
 
-#include "esp_dsp.h"
 #include "esphome/core/hal.h"
 #include "esphome/core/log.h"
 
@@ -22,7 +21,7 @@ static const char *const TAG = "sound_frequency";
 
 static const uint32_t MAX_FILL_DURATION_MS = 30;
 static const uint32_t RING_BUFFER_DURATION_MS = 120;
-/// Cap on the number of FFT frames averaged into one measurement window (bounds CPU at high sample rates)
+/// Cap on the number of Goertzel frames averaged into one measurement window (bounds CPU at high sample rates)
 static const uint32_t MAX_FFT_FRAMES = 32;
 
 void SoundFrequencyComponent::dump_config() {
@@ -47,39 +46,46 @@ void SoundFrequencyComponent::setup() {
     }
   });
 
-  // One-time esp-dsp initialization: FFT coefficient table and Hann window.
-  // The window size is a config constant, so all DSP buffers can be allocated here as well -
-  // no heap allocation happens from loop() after this point.
-  if (const auto init_res = dsps_fft2r_init_fc32(nullptr, this->window_size_); init_res != ESP_OK) {
-    ESP_LOGE(TAG, "esp-dsp FFT table init failed (code %d)", init_res);
-    return;
-  }
-
   const uint32_t n = this->window_size_;
-  // esp-dsp SIMD kernels require 16-byte aligned buffers
-  void *aligned_work = nullptr;
-  if (posix_memalign(&aligned_work, 16, 2 * n * sizeof(float)) != 0 || aligned_work == nullptr) {
-    ESP_LOGE(TAG, "Failed to allocate FFT work buffer (%" PRIu64 " bytes)", 2 * n * sizeof(float));
+
+  // Allocate and fill the Hann window. Computed directly – no esp_dsp needed.
+  float *window = static_cast<float *>(malloc(n * sizeof(float)));
+  if (window == nullptr) {
+    ESP_LOGE(TAG, "Failed to allocate window buffer (%" PRIu32 " bytes)", n * sizeof(float));
+    return;
+  }
+  for (uint32_t i = 0; i < n; ++i) {
+    window[i] = 0.5f * (1.0f - cosf(2.0f * (float) M_PI * (float) i / (float) (n - 1)));
+  }
+  this->window_ = window;
+
+  // Allocate Goertzel buffers at worst-case size (N/2 bins). Only the first
+  // num_bins_ entries will actually be used once the band is known.
+  const uint32_t max_bins = n / 2;
+
+  float *accum = static_cast<float *>(malloc(max_bins * sizeof(float)));
+  float *v1 = static_cast<float *>(malloc(max_bins * sizeof(float)));
+  float *v2 = static_cast<float *>(malloc(max_bins * sizeof(float)));
+  float *c2 = static_cast<float *>(malloc(max_bins * sizeof(float)));
+  if (accum == nullptr || v1 == nullptr || v2 == nullptr || c2 == nullptr) {
+    free(accum);
+    free(v1);
+    free(v2);
+    free(c2);
+    free(window);
+    ESP_LOGE(TAG, "Failed to allocate Goertzel buffers");
     return;
   }
 
-  float *window = static_cast<float *>(malloc(n * sizeof(float)));
-  float *accum = static_cast<float *>(malloc((n / 2) * sizeof(float)));
-  if (window == nullptr || accum == nullptr) {
-    free(window);
-    free(accum);
-    free(aligned_work);
-    ESP_LOGE(TAG, "Failed to allocate DSP buffers");
-    return;
-  }
+  this->accum_ = accum;
+  this->goertzel_v1_ = v1;
+  this->goertzel_v2_ = v2;
+  this->goertzel_c2_ = c2;
+  this->num_bins_ = 0;
+
+  memset(this->accum_, 0, max_bins * sizeof(float));
 
   this->dsp_initialized_ = true;
-  this->work_ = static_cast<float *>(aligned_work);
-  this->window_ = window;
-  this->accum_ = accum;
-
-  dsps_wind_hann_f32(this->window_, n);
-  memset(this->accum_, 0, (n / 2) * sizeof(float));
 
   if (!this->microphone_source_->is_passive()) {
     // Automatically start the microphone if not in passive mode
@@ -89,16 +95,15 @@ void SoundFrequencyComponent::setup() {
 
 void SoundFrequencyComponent::loop() {
   if ((this->frequency_sensor_ == nullptr) && (this->peak_magnitude_sensor_ == nullptr)) {
-    // No sensors configured, nothing to do
     return;
   }
 
-  if (!this->dsp_initialized_ || this->window_ == nullptr || this->work_ == nullptr || this->accum_ == nullptr) {
+  if (!this->dsp_initialized_ || this->window_ == nullptr || this->accum_ == nullptr || this->goertzel_v1_ == nullptr ||
+      this->goertzel_v2_ == nullptr || this->goertzel_c2_ == nullptr) {
     return;
   }
 
   if (this->microphone_source_->is_running() && !this->status_has_error()) {
-    // Allocate buffers
     if (this->start_()) {
       this->status_clear_warning();
     } else {
@@ -109,10 +114,8 @@ void SoundFrequencyComponent::loop() {
     if (!this->status_has_warning()) {
       this->status_set_warning(LOG_STR("Microphone is not running, can't compute dominant frequency"));
 
-      // Deallocate buffers, if necessary
       this->stop_();
 
-      // Reset sensor outputs
       if (this->frequency_sensor_ != nullptr) {
         this->frequency_sensor_->publish_state(NAN);
       }
@@ -120,8 +123,7 @@ void SoundFrequencyComponent::loop() {
         this->peak_magnitude_sensor_->publish_state(NAN);
       }
 
-      // Reset accumulators
-      memset(this->accum_, 0, (this->window_size_ / 2) * sizeof(float));
+      memset(this->accum_, 0, this->num_bins_ * sizeof(float));
       this->frame_count_ = 0;
       this->window_sample_count_ = 0;
       this->frame_buf_offset_ = 0;
@@ -136,8 +138,8 @@ void SoundFrequencyComponent::loop() {
 
   const auto &stream_info = this->microphone_source_->get_audio_stream_info();
 
-  // The sample rate is inherited from the microphone device and only known at runtime,
-  // so the in-band bin range is recomputed here (once per loop until it becomes valid)
+  // The sample rate is only known at runtime, so the in-band bin range and
+  // Goertzel coefficients are computed here (once, until valid).
   if (!this->band_valid_) {
     const float fs = static_cast<float>(stream_info.get_sample_rate());
     this->sample_rate_hz_ = fs;
@@ -146,52 +148,54 @@ void SoundFrequencyComponent::loop() {
     uint32_t k_min = static_cast<uint32_t>(std::ceil((this->min_frequency_hz_ * static_cast<double>(n)) / fs));
     uint32_t k_max = static_cast<uint32_t>((this->max_frequency_hz_ * static_cast<double>(n) / fs));
     if (k_min < 1) {
-      k_min = 1;  // exclude DC bin
+      k_min = 1;
     }
     if (k_max > n / 2 - 1) {
-      k_max = n / 2 - 1;  // exclude the Nyquist bin
+      k_max = n / 2 - 1;
     }
 
     this->k_min_ = k_min;
     this->k_max_ = k_max;
     this->band_valid_ = (k_min < k_max);
+
     if (!this->band_valid_) {
       ESP_LOGW(TAG,
                "Frequency band %.0f-%.0f Hz is outside the analyzable range for a sample rate of %" PRIu32
                " Hz and window size %" PRIu32,
                this->min_frequency_hz_, this->max_frequency_hz_, stream_info.get_sample_rate(), n);
     } else {
-      ESP_LOGW(TAG,
-               "Frequency band %.0f-%.0f Hz maps to bins %lu-%lu of %" PRIu32 " (sample rate %" PRIu32
-               " Hz, window size %" PRIu32 ")",
+      this->num_bins_ = k_max - k_min + 1;
+
+      // Precompute 2*cos(2*pi*k/N) for each target bin (the IIR coefficient)
+      for (uint32_t b = 0; b < this->num_bins_; ++b) {
+        const uint32_t k = k_min + b;
+        const float angle = 2.0f * (float) M_PI * (float) k / (float) n;
+        this->goertzel_c2_[b] = 2.0f * cosf(angle);
+      }
+
+      ESP_LOGW(TAG, "Goertzel band %.0f-%.0f Hz -> bins %lu-%lu (%lu bins, sample rate %" PRIu32 " Hz, N=%" PRIu32 ")",
                this->min_frequency_hz_, this->max_frequency_hz_, static_cast<unsigned long>(k_min),
-               static_cast<unsigned long>(k_max), n / 2, stream_info.get_sample_rate(), n);
+               static_cast<unsigned long>(k_max), static_cast<unsigned long>(this->num_bins_),
+               stream_info.get_sample_rate(), n);
     }
   }
 
   const uint32_t samples_in_window = stream_info.ms_to_samples(this->measurement_duration_ms_);
 
-  // The audio source only exposes up to MAX_FILL_DURATION_MS of audio per fill() call, which is typically far less
-  // than a full FFT window. Assemble the measurement window by staging samples from successive fill/consume cycles
-  // into frame_buf_ until a whole N-sample frame has accumulated, then run one FFT on it. Bounded by both the
-  // available audio and MAX_FFT_FRAMES so a single loop() call never dominates CPU. This also keeps draining the
-  // ring buffer so the mic writer is not starved of space.
+  // Stage samples into frame_buf_ and run Goertzel on each complete N-sample frame.
   while (this->frame_count_ < MAX_FFT_FRAMES && this->window_sample_count_ < samples_in_window) {
     if (this->frame_buf_offset_ >= this->window_size_) {
-      // A full frame has been staged - analyze it now
-      this->process_fft_frame_(this->frame_buf_);
+      this->process_goertzel_frame_(this->frame_buf_);
       this->frame_buf_offset_ = 0;
       this->frame_count_++;
       this->window_sample_count_ += this->window_size_;
     }
 
-    // Expose a chunk of the ring buffer's internal storage - don't block to avoid slowing the main loop.
-    // pre_shift is ignored by RingBufferAudioSource (no intermediate transfer buffer to compact).
     this->audio_source_->fill(0, false);
 
     const uint32_t samples_available = stream_info.bytes_to_samples(this->audio_source_->available());
     if (samples_available == 0) {
-      break;  // no more audio available right now; wait for the mic to fill more
+      break;
     }
     const int16_t *data = reinterpret_cast<const int16_t *>(this->audio_source_->mutable_data());
 
@@ -204,42 +208,49 @@ void SoundFrequencyComponent::loop() {
 
   if (this->frame_count_ > 0) {
     if (this->band_valid_) {
-      // Emit the window when the measurement duration has been covered or the frame cap is reached
       if (this->window_sample_count_ >= samples_in_window || this->frame_count_ >= MAX_FFT_FRAMES) {
         ESP_LOGW(TAG, "Window emit: %" PRIu32 " frames, %" PRIu32 "/%" PRIu32 " samples (%" PRIu32 " ms target)",
                  this->frame_count_, this->window_sample_count_, samples_in_window, this->measurement_duration_ms_);
         this->emit_window_();
       }
     } else {
-      // Band invalid: drain the window so the counters stay bounded, but publish nothing new
-      memset(this->accum_, 0, (this->window_size_ / 2) * sizeof(float));
+      memset(this->accum_, 0, this->num_bins_ * sizeof(float));
       this->frame_count_ = 0;
       this->window_sample_count_ = 0;
     }
   }
 }
 
-bool SoundFrequencyComponent::process_fft_frame_(const int16_t *samples) {
+bool SoundFrequencyComponent::process_goertzel_frame_(const int16_t *samples) {
   const uint32_t n = this->window_size_;
+  const uint32_t nb = this->num_bins_;
 
-  // Normalize to [-1, 1) and apply the Hann window. Only one real signal is analyzed, so the
-  // imaginary (second) input of the packed complex pair is zeroed.
-  for (uint32_t i = 0; i < n; ++i) {
-    const float sample = static_cast<float>(samples[i]) / 32768.0f;
-    this->work_[2 * i] = sample * this->window_[i];
-    this->work_[2 * i + 1] = 0.0f;
+  // Reset Goertzel state for this frame
+  for (uint32_t b = 0; b < nb; ++b) {
+    this->goertzel_v1_[b] = 0.0f;
+    this->goertzel_v2_[b] = 0.0f;
   }
 
-  // Real FFT packed as a complex transform, then unpacked back to the real-signal spectrum
-  dsps_fft2r_fc32(this->work_, n);
-  dsps_bit_rev_fc32(this->work_, n);
-  dsps_cplx2reC_fc32(this->work_, n);
+  // Run the IIR recursion: v[n] = c2 * v[n-1] - v[n-2] + x[n]
+  // Process sample-by-sample across all bins for cache-friendly access to the
+  // windowed input, while bin state lives in a small contiguous array.
+  for (uint32_t i = 0; i < n; ++i) {
+    const float x = static_cast<float>(samples[i]) / 32768.0f * this->window_[i];
+    for (uint32_t b = 0; b < nb; ++b) {
+      const float v = this->goertzel_c2_[b] * this->goertzel_v1_[b] - this->goertzel_v2_[b] + x;
+      this->goertzel_v2_[b] = this->goertzel_v1_[b];
+      this->goertzel_v1_[b] = v;
+    }
+  }
 
-  // Accumulate the power spectrum (periodogram averaging over the measurement window)
-  for (uint32_t k = 0; k < n / 2; ++k) {
-    const float re = this->work_[2 * k];
-    const float im = this->work_[2 * k + 1];
-    this->accum_[k] += re * re + im * im;
+  // Optimized magnitude-squared (no complex arithmetic):
+  //   |X[k]|^2 = v1^2 + v2^2 - c2 * v1 * v2
+  // Accumulate power (periodogram averaging over the measurement window)
+  for (uint32_t b = 0; b < nb; ++b) {
+    const float v1 = this->goertzel_v1_[b];
+    const float v2 = this->goertzel_v2_[b];
+    const float mag2 = v1 * v1 + v2 * v2 - this->goertzel_c2_[b] * v1 * v2;
+    this->accum_[b] += mag2;
   }
 
   return true;
@@ -247,46 +258,49 @@ bool SoundFrequencyComponent::process_fft_frame_(const int16_t *samples) {
 
 void SoundFrequencyComponent::emit_window_() {
   const uint32_t n = this->window_size_;
+  const uint32_t nb = this->num_bins_;
 
-  // Average the accumulated periodogram over the frames collected for this window
+  // Average the accumulated power over the frames collected for this window
   if (this->frame_count_ > 0) {
     const float inv_frames = 1.0f / static_cast<float>(this->frame_count_);
-    for (uint32_t k = 0; k < n / 2; ++k) {
-      this->accum_[k] *= inv_frames;
+    for (uint32_t b = 0; b < nb; ++b) {
+      this->accum_[b] *= inv_frames;
     }
   }
 
   // Peak-pick the strongest in-band bin
-  uint32_t k_star = 0;
+  uint32_t b_star = 0;
   float peak_p = 0.0f;
-  if (this->band_valid_) {
-    k_star = this->k_min_;
-    peak_p = this->accum_[k_star];
-    for (uint32_t k = this->k_min_ + 1; k <= this->k_max_; ++k) {
-      if (this->accum_[k] > peak_p) {
-        peak_p = this->accum_[k];
-        k_star = k;
+  if (this->band_valid_ && nb > 0) {
+    b_star = 0;
+    peak_p = this->accum_[0];
+    for (uint32_t b = 1; b < nb; ++b) {
+      if (this->accum_[b] > peak_p) {
+        peak_p = this->accum_[b];
+        b_star = b;
       }
     }
   }
 
-  // Approximate dBFS for a bin-centered full-scale sine (the Hann window halves the in-band energy)
+  // Approximate dBFS for a bin-centered full-scale sine (Hann window halves in-band energy)
   const float ref = static_cast<float>(n);
   const float peak_db = (peak_p > 0.0f) ? 10.0f * log10f(peak_p / ref) : -300.0f;
 
-  // Publish the peak level unconditionally so automations can gate on loudness independent of frequency
   if (this->peak_magnitude_sensor_ != nullptr) {
     this->peak_magnitude_sensor_->publish_state(peak_db);
   }
 
   bool publish_frequency = false;
   float frequency_hz = NAN;
-  if (this->band_valid_ && peak_db >= this->peak_threshold_db_) {
-    // Sub-bin refinement with a parabolic fit on the log-magnitude around the peak
+
+  if (this->band_valid_ && peak_db >= this->peak_threshold_db_ && nb > 0) {
+    // Sub-bin refinement: parabolic fit on log-magnitude around the peak.
+    // Requires the two adjacent bins, so skip if the peak is at the edge of
+    // the evaluated range.
     float alpha = 0.0f;
-    if (k_star > 0 && k_star + 1 < n / 2) {
-      const float p_m1 = this->accum_[k_star - 1];
-      const float p_p1 = this->accum_[k_star + 1];
+    if (b_star > 0 && b_star + 1 < nb) {
+      const float p_m1 = this->accum_[b_star - 1];
+      const float p_p1 = this->accum_[b_star + 1];
       if (p_m1 > 0.0f && peak_p > 0.0f && p_p1 > 0.0f) {
         const float db_m1 = 0.5f * log10f(p_m1);
         const float db_0 = 0.5f * log10f(peak_p);
@@ -303,6 +317,7 @@ void SoundFrequencyComponent::emit_window_() {
       }
     }
 
+    const uint32_t k_star = this->k_min_ + b_star;
     frequency_hz = (static_cast<float>(k_star) + alpha) * this->sample_rate_hz_ / static_cast<float>(n);
     publish_frequency = true;
   }
@@ -311,13 +326,14 @@ void SoundFrequencyComponent::emit_window_() {
     this->frequency_sensor_->publish_state(publish_frequency ? frequency_hz : NAN);
   }
 
+  const uint32_t k_star_abs = this->k_min_ + b_star;
   ESP_LOGW(TAG, "Window result: bin %lu (%.1f Hz), peak %.2f dB vs threshold %.1f dB -> %s",
-           static_cast<unsigned long>(k_star),
-           (static_cast<float>(k_star) * this->sample_rate_hz_) / static_cast<float>(n), peak_db,
+           static_cast<unsigned long>(k_star_abs),
+           (static_cast<float>(k_star_abs) * this->sample_rate_hz_) / static_cast<float>(n), peak_db,
            this->peak_threshold_db_, publish_frequency ? "publish" : "suppress");
 
   // Reset accumulators for the next measurement window
-  memset(this->accum_, 0, (n / 2) * sizeof(float));
+  memset(this->accum_, 0, nb * sizeof(float));
   this->frame_count_ = 0;
   this->window_sample_count_ = 0;
 }
@@ -346,9 +362,7 @@ bool SoundFrequencyComponent::start_() {
   const auto &stream_info = this->microphone_source_->get_audio_stream_info();
   const size_t bytes_per_frame = stream_info.frames_to_bytes(1);
 
-  // Allocate a ring buffer for the microphone callback to write into. Round the size down to a multiple
-  // of bytes_per_frame so the wrap boundary stays frame-aligned and avoids unnecessary single-frame splices.
-  this->ring_buffer_.reset();  // Reset pointer to any previous ring buffer allocation
+  this->ring_buffer_.reset();
   const size_t ring_buffer_size =
       (stream_info.ms_to_bytes(RING_BUFFER_DURATION_MS) / bytes_per_frame) * bytes_per_frame;
   std::shared_ptr<ring_buffer::RingBuffer> temp_ring_buffer = ring_buffer::RingBuffer::create(ring_buffer_size);
@@ -357,8 +371,6 @@ bool SoundFrequencyComponent::start_() {
     return false;
   }
 
-  // Zero-copy source that reads directly from the ring buffer's internal storage. Frame-aligned reads
-  // ensure multi-channel frames are never split across the ring buffer's wrap boundary.
   this->audio_source_ = audio::RingBufferAudioSource::create(
       temp_ring_buffer, stream_info.ms_to_bytes(MAX_FILL_DURATION_MS), static_cast<uint8_t>(bytes_per_frame));
   if (this->audio_source_ == nullptr) {
@@ -368,14 +380,9 @@ bool SoundFrequencyComponent::start_() {
 
   this->ring_buffer_ = temp_ring_buffer;
 
-  // The audio source only ever exposes MAX_FILL_DURATION_MS of audio at a time, which is typically less than one
-  // FFT window, so a full frame must be assembled from several fill/consume cycles. This buffer stages those
-  // partial frames until a complete window has accumulated. One extra sample guards the copy bounds below. It is
-  // (re)allocated here - not in setup() - because stop_() frees it when the microphone stops, and it must be
-  // restored whenever the audio source is created again.
   this->frame_buf_ = static_cast<int16_t *>(malloc((this->window_size_ + 1) * sizeof(int16_t)));
   if (this->frame_buf_ == nullptr) {
-    ESP_LOGE(TAG, "Failed to allocate FFT frame buffer");
+    ESP_LOGE(TAG, "Failed to allocate Goertzel frame buffer");
     this->audio_source_.reset();
     this->ring_buffer_.reset();
     this->status_momentary_error("frame_buf", 15000);

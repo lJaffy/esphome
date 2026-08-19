@@ -49,13 +49,14 @@ class SoundFrequencyComponent : public Component {
   /// @brief Internal stop command that deallocates ``audio_source_`` (which releases its ring buffer)
   void stop_();
 
-  /// @brief Runs the esp-dsp real FFT on one full window of samples and accumulates the power spectrum
-  bool process_fft_frame_(const int16_t *samples);
+  /// @brief Runs the Goertzel IIR recursion on one full N-sample window for all in-band bins
+  /// and accumulates the resulting power into ``accum_``
+  bool process_goertzel_frame_(const int16_t *samples);
 
-  /// @brief Averages the accumulated periodogram, picks the in-band peak, refines it sub-bin, and publishes
+  /// @brief Averages the accumulated power spectrum, picks the in-band peak, refines it sub-bin, and publishes
   void emit_window_();
 
-  microphone::MicrophoneSource *microphone_source_{nullptr};
+  microphone::MicrophoneSource *microphone_source_;
 
   sensor::Sensor *frequency_sensor_{nullptr};
   sensor::Sensor *peak_magnitude_sensor_{nullptr};
@@ -70,13 +71,16 @@ class SoundFrequencyComponent : public Component {
 
   uint32_t measurement_duration_ms_{1000};
 
-  // DSP working set, allocated once in setup() - no heap is touched from loop() after that
-  float *window_{nullptr};  ///< Hann window coefficients, N floats
-  float *work_{nullptr};    ///< complex FFT work buffer (interleaved re/im), 2*N floats, 16-byte aligned
-  float *accum_{nullptr};   ///< averaged power spectrum accumulator, N/2 floats
+  // DSP working set, allocated once in setup() – no heap is touched from loop() after that
+  float *window_{nullptr};       ///< Hann window coefficients, N floats
+  float *accum_{nullptr};        ///< averaged power spectrum accumulator, num_bins_ floats
+  float *goertzel_v1_{nullptr};  ///< IIR state v1 (previous sample), num_bins_ floats
+  float *goertzel_v2_{nullptr};  ///< IIR state v2 (sample before previous), num_bins_ floats
+  float *goertzel_c2_{nullptr};  ///< precomputed 2·cos(2πk/N) per bin, num_bins_ floats
 
-  uint32_t k_min_{0};  ///< first in-band bin index (excludes DC)
-  uint32_t k_max_{0};  ///< last in-band bin index (excludes Nyquist)
+  uint32_t k_min_{0};     ///< first in-band DFT bin index (excludes DC)
+  uint32_t k_max_{0};     ///< last in-band DFT bin index (excludes Nyquist)
+  uint32_t num_bins_{0};  ///< number of Goertzel filters = k_max - k_min + 1 (valid once band is known)
 
   float sample_rate_hz_{0.0f};  ///< runtime sample rate taken from the microphone device
 
@@ -86,13 +90,13 @@ class SoundFrequencyComponent : public Component {
   uint32_t diagnostic_log_ms_{0};          ///< wall-clock time of the last periodic diagnostic log (ms)
   bool diagnostic_window_emitted_{false};  ///< true once the first measurement window has been emitted
 
-  uint32_t frame_count_{0};          ///< FFT frames accumulated into ``accum_`` since the last window emit
+  uint32_t frame_count_{0};          ///< Goertzel frames accumulated into ``accum_`` since the last window emit
   uint32_t window_sample_count_{0};  ///< samples consumed since the last window emit
 
-  // Ring buffer for partial FFT frames. The audio source only exposes up to MAX_FILL_DURATION_MS of audio per
-  // fill() call, which is usually far less than a full FFT window, so the window must be assembled from several
-  // fill/consume cycles. Samples are copied here and run through the FFT in whole-window units. Allocated in
-  // start_() (re-created whenever the audio source is created), freed in stop_().
+  // Ring buffer for partial frames. The audio source only exposes up to MAX_FILL_DURATION_MS of audio per
+  // fill() call, which is usually far less than a full N-sample window, so the window must be assembled from
+  // several fill/consume cycles. Samples are staged here and run through Goertzel in whole-window units.
+  // Allocated in start_() (re-created whenever the audio source is created), freed in stop_().
   int16_t *frame_buf_{nullptr};
   uint32_t frame_buf_offset_{0};  ///< samples currently staged in ``frame_buf_``
 };
